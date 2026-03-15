@@ -60,7 +60,9 @@ manipulation/symbolic/viz/*.png
 manipulation/symbolic/domains/tabletop/pddl/problems/*.pddl
 examples/grasp_captures/*.png
 wandb/
+training_runs/
 .history_max
 MUJOCO_LOG.TXT
 notes.md
 *.pddl
+dexart_baselines/*
