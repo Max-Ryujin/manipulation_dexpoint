@@ -149,7 +149,7 @@ class FrankaGymEnvironment(gym.Env):
 
         rl_dt = self.env.model.opt.timestep * self.env.frame_skip
 
-        target_arm_qpos = current_arm_qpos + (2 * arm_action * rl_dt)
+        target_arm_qpos = current_arm_qpos + (1.5 * arm_action * rl_dt)
 
         target_gripper_ctrl = ((gripper_action + 1.0) / 2.0) * 255.0
         target_ctrl = np.append(target_arm_qpos, target_gripper_ctrl)
@@ -179,7 +179,7 @@ class FrankaGymEnvironment(gym.Env):
         all_points = []
 
         # Number of samples per camera (distributed evenly)
-        samples_per_camera = (4 * self.num_points) // len(self.camera_names)
+        samples_per_camera = 10 * self.num_points
 
         bounds = self.domain.get_working_bounds()
         info = self.domain.get_domain_info()
@@ -188,6 +188,10 @@ class FrankaGymEnvironment(gym.Env):
         min_y = bounds["min_y"]
         max_y = bounds["max_y"]
         min_z = info["table_height"]
+
+        hand_id = self.env.model.body("hand").id
+        hand_pos = self.env.data.xpos[hand_id]
+        sphere_radius = 0.12
 
         for camera_name in self.camera_names:
             points, colors, pixels, depths = self.camera.get_pointcloud(
@@ -201,14 +205,20 @@ class FrankaGymEnvironment(gym.Env):
 
             if len(points) > 0:
                 # Keep only points inside XY workspace
-                mask = (
+                workspace_mask = (
                     (points[:, 0] >= min_x)
                     & (points[:, 0] <= max_x)
                     & (points[:, 1] >= min_y)
                     & (points[:, 1] <= max_y)
                     & (points[:, 2] > (min_z + 0.01))
-                    & (points[:, 2] < min_z + 0.4)
+                    & (points[:, 2] < min_z + 0.2)
                 )
+
+                dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
+                hand_mask = dist_to_hand < sphere_radius
+
+                # Combine both regions
+                mask = workspace_mask | hand_mask
 
                 points = points[mask]
 
@@ -217,10 +227,11 @@ class FrankaGymEnvironment(gym.Env):
 
         # check if there are arrays to stack
         if len(all_points) == 0:
-            return self._get_observation()  # Try again if no points were captured
+            return (
+                self._get_observation()
+            )  # Try again if no points were captured (TODO: prevent infinite recursion)
         else:
             merged_points = np.vstack(all_points)
-
         if len(merged_points) > self.num_points:
             # Random sampling to reduce to target size
             indices = np.random.choice(
@@ -273,6 +284,12 @@ class FrankaGymEnvironment(gym.Env):
         """
         self.task_config = task_config
         self.max_episode_steps = task_config.get("max_episode_steps", 500)
+        self.n_blocks_to_place = task_config.get(
+            "n_blocks_to_place", self.n_blocks_to_place
+        )
+        self.randomize_blocks = task_config.get(
+            "randomize_blocks", self.randomize_blocks
+        )
 
     def set_task_reward(self, reward_fn):
         """Set a custom reward function."""
@@ -339,7 +356,7 @@ class FrankaGymEnvironment(gym.Env):
 
             # Get point cloud for this camera
             # Use only the points from this specific camera to avoid confusion
-            samples_per_camera = 4 * self.num_points
+            samples_per_camera = 10 * self.num_points
             points, colors, pixels, depths = self.camera.get_pointcloud(
                 camera_name,
                 width=self.camera_width,
@@ -357,14 +374,24 @@ class FrankaGymEnvironment(gym.Env):
             max_y = bounds["max_y"]
             min_z = info["table_height"]
 
-            mask = (
+            hand_id = self.env.model.body("hand").id
+            hand_pos = self.env.data.xpos[hand_id]
+            sphere_radius = 0.12
+
+            workspace_mask = (
                 (points[:, 0] >= min_x)
                 & (points[:, 0] <= max_x)
                 & (points[:, 1] >= min_y)
                 & (points[:, 1] <= max_y)
                 & (points[:, 2] > (min_z + 0.01))
-                & (points[:, 2] < min_z + 0.4)
+                & (points[:, 2] < min_z + 0.2)
             )
+
+            dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
+            hand_mask = dist_to_hand < sphere_radius
+
+            # Combine both regions
+            mask = workspace_mask | hand_mask
 
             points = points[mask]
             colors = colors[mask]
