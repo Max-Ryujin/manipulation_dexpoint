@@ -182,7 +182,7 @@ def train_dexpoint(
             target_kl=None,
             create_eval_env=True,
             policy_kwargs={
-                "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
+                #"net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
             },
             verbose=verbose,
