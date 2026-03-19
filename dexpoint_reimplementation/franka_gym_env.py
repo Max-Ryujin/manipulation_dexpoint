@@ -6,6 +6,9 @@ from gym import spaces
 from typing import Dict, Tuple, Optional, Any, List
 from pathlib import Path
 import cv2
+from collections import deque
+from datetime import datetime
+import imageio
 
 from manipulation import FrankaEnvironment
 from manipulation.perception import MujocoCamera
@@ -96,8 +99,6 @@ class FrankaGymEnvironment(gym.Env):
             }
         )
 
-        # Action space: 8D joint target positions (relative deltas bounded)
-        # Assuming Franka 8-DOF arm with reasonable joint limits
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.robot_dof,), dtype=np.float32
         )
@@ -106,6 +107,10 @@ class FrankaGymEnvironment(gym.Env):
         self.task_config = {}
         self.max_episode_steps = 1000
         self.step_count = 0
+
+        # Frame buffering for edge case debugging
+        self.frame_buffer = deque(maxlen=self.max_episode_steps)
+        self.episode_frames = []
 
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
@@ -123,6 +128,11 @@ class FrankaGymEnvironment(gym.Env):
             self.env.step()
 
         self.step_count = 0
+
+        # Clear frame buffer for new episode
+        self.frame_buffer.clear()
+        self.episode_frames = []
+
         obs = self._get_observation()
         return obs
 
@@ -151,7 +161,9 @@ class FrankaGymEnvironment(gym.Env):
 
         target_arm_qpos = current_arm_qpos + (1.5 * arm_action * rl_dt)
 
-        target_gripper_ctrl = ((gripper_action + 1.0) / 2.0) * 255.0
+        target_gripper_ctrl = ((gripper_action + 1.0) / 2.0) * (
+            self.ctrl_max[7] - self.ctrl_min[7]
+        ) + self.ctrl_min[7]
         target_ctrl = np.append(target_arm_qpos, target_gripper_ctrl)
 
         target_ctrl = np.clip(target_ctrl, self.ctrl_min, self.ctrl_max)
@@ -160,6 +172,11 @@ class FrankaGymEnvironment(gym.Env):
         # Step simulation
         self.env.step()
         self.step_count += 1
+
+        # Capture frame for episode buffer
+        frame = self.render(mode="rgb_array")
+        if frame is not None:
+            self.episode_frames.append(frame)
 
         # Get observation
         obs = self._get_observation()
@@ -172,6 +189,10 @@ class FrankaGymEnvironment(gym.Env):
             done = True
             info["step_limit_reached"] = True
 
+        # Clear frames on successful episode completion
+        if done:
+            self.episode_frames = []
+
         return obs, reward, done, info
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
@@ -179,7 +200,7 @@ class FrankaGymEnvironment(gym.Env):
         all_points = []
 
         # Number of samples per camera (distributed evenly)
-        samples_per_camera = 10 * self.num_points
+        samples_per_camera = 15 * self.num_points
 
         bounds = self.domain.get_working_bounds()
         info = self.domain.get_domain_info()
@@ -227,20 +248,48 @@ class FrankaGymEnvironment(gym.Env):
 
         # check if there are arrays to stack
         if len(all_points) == 0:
-            return (
-                self._get_observation()
-            )  # Try again if no points were captured (TODO: prevent infinite recursion)
+            hand_id = self.env.model.body("hand").id
+            hand_pos = self.env.data.xpos[hand_id].copy()
+            max_joint_speed = float(np.max(np.abs(self.env.data.qvel[: self.robot_dof])))
+            print(
+                "[FrankaGymEnvironment] no valid points "
+                f"step={self.step_count} hand_pos={np.array2string(hand_pos, precision=3)} "
+                f"max_joint_speed={max_joint_speed:.3f} contacts={int(self.env.data.ncon)}"
+            )
+
+            # Save debug images and video of current episode
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_dir = Path(f"debug_no_points_{timestamp}")
+            debug_dir.mkdir(exist_ok=True)
+
+            # Save individual frames from each camera
+            for name in self.camera_names:
+                image = self.render(mode=f"camera_{name}")
+                cv2.imwrite(str(debug_dir / f"debug_{name}.png"), image)
+
+            # Save episode video if frames were captured
+            if len(self.episode_frames) > 0:
+                video_path = debug_dir / f"episode_video_{timestamp}.mp4"
+                imageio.mimwrite(str(video_path), self.episode_frames, fps=30)
+
+            return None
+
         else:
             merged_points = np.vstack(all_points)
-        if len(merged_points) > self.num_points:
+
+        # Center point cloud to origin (subtract mean of actual points)
+        pointcloud_mean = merged_points.mean(axis=0)
+        merged_points_centered = (merged_points - pointcloud_mean).astype(np.float32)
+
+        if len(merged_points_centered) > self.num_points:
             # Random sampling to reduce to target size
             indices = np.random.choice(
-                len(merged_points), size=self.num_points, replace=False
+                len(merged_points_centered), size=self.num_points, replace=False
             )
-            pointcloud = merged_points[indices].astype(np.float32)
+            pointcloud = merged_points_centered[indices]
         else:
             # Pad with zeros if not enough points
-            pointcloud = merged_points.astype(np.float32)
+            pointcloud = merged_points_centered
             if len(pointcloud) < self.num_points:
                 pad_size = self.num_points - len(pointcloud)
                 padding = np.zeros((pad_size, 3), dtype=np.float32)
@@ -356,7 +405,7 @@ class FrankaGymEnvironment(gym.Env):
 
             # Get point cloud for this camera
             # Use only the points from this specific camera to avoid confusion
-            samples_per_camera = 10 * self.num_points
+            samples_per_camera = 15 * self.num_points
             points, colors, pixels, depths = self.camera.get_pointcloud(
                 camera_name,
                 width=self.camera_width,
