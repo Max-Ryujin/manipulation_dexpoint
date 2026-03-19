@@ -316,7 +316,12 @@ class MujocoCamera:
         valid_indices = np.where(valid_mask)[0]
 
         if len(valid_indices) == 0:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8),
+                np.zeros((0, 2), dtype=np.int32),
+                np.zeros((0,), dtype=np.float32),
+            )
 
         # Random sampling to reduce point count
         if len(valid_indices) > num_samples:
