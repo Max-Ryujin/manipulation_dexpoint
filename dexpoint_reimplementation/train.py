@@ -1,0 +1,423 @@
+"""Training script for DexPoint on Franka robots."""
+
+import imageio
+import numpy as np
+from pathlib import Path
+import json
+from datetime import datetime
+import sys
+from typing import TYPE_CHECKING
+import wandb
+
+# Add dexart to path
+root_path = Path(__file__).parent.parent
+sys.path.insert(0, str(root_path))
+
+# Import the local fork first so it registers itself as stable_baselines3.
+import dexart_baselines.stable_baselines3  # noqa: F401
+
+from franka_gym_env import FrankaGymEnvironment
+from tasks import create_task_config
+from training_callbacks import TaskInfoLoggingCallback
+
+if TYPE_CHECKING:
+    from dexart_baselines.stable_baselines3.ppo import PPO
+    from dexart_baselines.stable_baselines3.common.policies import (
+        MultiInputActorCriticPolicy,
+    )
+else:
+    # Import PPO from the local stable_baselines3 fork via the registered alias.
+    from stable_baselines3.ppo import PPO
+    from stable_baselines3.common.policies import (
+        MultiInputActorCriticPolicy,
+    )
+from dexpoint_policy import DexPointPolicy
+
+# from dexart_baselines.stable_baselines3.common.policies import MlpPolicy
+
+
+def add_batch_dimension(obs):
+    """
+    Add batch dimension to observation dict if not already present.
+
+    Args:
+        obs: Dict of numpy arrays from env.reset() or env.step()
+
+    Returns:
+        batched_obs: Dict with batch dimension added to each observation
+    """
+    if isinstance(obs, dict):
+        batched_obs = {}
+        for key, value in obs.items():
+            if isinstance(value, np.ndarray):
+                batched_obs[key] = np.expand_dims(value, axis=0)
+            else:
+                batched_obs[key] = value
+        return batched_obs
+    return obs
+
+
+_HERE = Path(__file__).parent
+_BLOCKS_XML = (
+    _HERE
+    / ".."
+    / "manipulation"
+    / "environments"
+    / "assets"
+    / "franka_emika_panda"
+    / "scene_blocks.xml"
+)
+_OUTPUT_DIR = _HERE / "training_runs"
+
+
+def create_output_dir():
+    """Create output directory for training results."""
+    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Create timestamped subdirectory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = _OUTPUT_DIR / f"dexpoint_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    return run_dir
+
+
+def train_dexpoint(
+    task_name: str = "two_blocks_on_platform",
+    total_timesteps: int = 100000,
+    learning_rate: float = 3e-4,
+    batch_size: int = 64,
+    n_epochs: int = 10,
+    n_steps: int = 2048,
+    save_interval: int = 20000,
+    verbose: int = 1,
+    use_wandb: bool = False,
+    record_video: bool = True,
+    video_interval: int = 20000,
+):
+    """
+    Train DexPoint policy using PPO.
+
+    Args:
+        task_name: Task to train on ("two_blocks_on_platform" or "grasping")
+        total_timesteps: Total training timesteps
+        learning_rate: Learning rate for Adam optimizer
+        batch_size: Batch size for PPO updates
+        n_epochs: Number of policy update epochs per rollout
+        n_steps: Number of steps to collect per update
+        save_interval: Save model every N timesteps
+        verbose: Verbosity level (0=silent, 1=verbose)
+        use_wandb: Enable Weights & Biases logging
+        record_video: Record training videos
+        video_interval: Record video every N timesteps
+    """
+    print("\n" + "=" * 70)
+    print("DexPoint Training - Franka Manipulation")
+    print("=" * 70)
+
+    if use_wandb:
+        wandb.init(
+            project="dexpoint-franka",
+            name=f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            config={
+                "task": task_name,
+                "total_timesteps": total_timesteps,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "n_epochs": n_epochs,
+                "n_steps": n_steps,
+                "save_interval": save_interval,
+                "video_interval": video_interval,
+                "pointcloud_points": 512,
+            },
+        )
+
+    # Create output directory
+    run_dir = create_output_dir()
+    print(f"\nOutput directory: {run_dir}")
+
+    # Create environment
+    print(f"\n Creating environment...")
+    env = FrankaGymEnvironment(
+        xml_path=_BLOCKS_XML.as_posix(),
+        task_name=task_name,
+        num_points=512,
+        camera_height=480,
+        camera_width=640,
+        rate=200.0,
+        frame_skip=10,
+        visualize_pointclouds=record_video,  # Enable point cloud visualization in videos
+        pointcloud_point_size=1,
+        pointcloud_alpha=0.7,
+    )
+
+    # Configure task
+    task_config = create_task_config(task_name, max_episode_steps=1000)
+    env.configure_task(task_config)
+    print(f"✓ Environment ready")
+    print(f"  - Task: {task_name}")
+    print(f"  - Observation space: {env.observation_space}")
+    print(f"  - Action space: {env.action_space}")
+
+    # Create PPO agent
+    print(f"\n Creating PPO agent...")
+
+    try:
+        agent = PPO(
+            policy=DexPointPolicy,
+            env=env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            clip_range_vf=None,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            use_sde=False,
+            sde_sample_freq=-1,
+            target_kl=None,
+            create_eval_env=True,
+            policy_kwargs={
+                "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
+                "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+            },
+            verbose=verbose,
+            wandb_project="dexpoint-franka" if use_wandb else None,
+            wandb_run_name=(
+                f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                if use_wandb
+                else None
+            ),
+        )
+        print(f"|PPO agent created")
+    except Exception as e:
+        print(f"Failed to create PPO agent: {e}")
+        agent = None
+
+    if agent is None:
+        env.close()
+        return
+
+    # Training configuration
+    print(f"\n Training configuration:")
+    print(f"  - Total timesteps: {total_timesteps}")
+    print(f"  - Learning rate: {learning_rate}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Epochs per update: {n_epochs}")
+    print(f"  - Steps per update: {n_steps}")
+    print(f"  - Save checkpoint every: {save_interval} steps")
+
+    # Save training config
+    config = {
+        "task": task_name,
+        "total_timesteps": total_timesteps,
+        "learning_rate": learning_rate,
+        "batch_size": batch_size,
+        "n_epochs": n_epochs,
+        "n_steps": n_steps,
+        "timestamp": datetime.now().isoformat(),
+        "use_wandb": use_wandb,
+        "record_video": record_video,
+        "video_interval": video_interval,
+        "env_config": {
+            "num_points": 512,
+            "camera_names": ["top_camera", "side_camera", "front_camera"],
+            "n_blocks_to_place": env.n_blocks_to_place,
+        },
+    }
+
+    config_path = run_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  - Config saved to: {config_path}")
+
+    print(f"  Starting training loop...")
+
+    try:
+        n_save_steps = save_interval
+        steps_so_far = 0
+        step_count = 0
+        video_frames = []
+        video_writer = None
+        training_callback = TaskInfoLoggingCallback(use_wandb=use_wandb)
+
+        while steps_so_far < total_timesteps:
+            remaining = total_timesteps - steps_so_far
+            train_steps = min(n_save_steps, remaining)
+
+            print(
+                f"\n  Training batch {step_count + 1}: {train_steps} steps ({steps_so_far}/{total_timesteps} total)"
+            )
+
+            # Train for this batch
+            agent.learn(
+                total_timesteps=train_steps,
+                callback=training_callback,
+                reset_num_timesteps=(step_count == 0),
+            )
+            steps_so_far += train_steps
+            step_count += 1
+
+            # Record video if needed
+            if record_video and (steps_so_far % video_interval == 0):
+                print(f"    Recording validation video...")
+                video_frames = []
+                obs = env.reset()
+                episode_reward = 0.0
+                episode_steps = 0
+                max_episode_steps_video = 1000
+
+                while episode_steps < max_episode_steps_video:
+                    frame = env.render_with_pointcloud(mode="rgb_array")
+                    if frame is not None:
+                        video_frames.append(frame)
+
+                    batched_obs = add_batch_dimension(obs)
+                    action, _ = agent.predict(batched_obs, deterministic=True)
+
+                    if isinstance(action, np.ndarray) and action.ndim > 1:
+                        action = action[0]
+
+                    obs, reward, done, info = env.step(action)
+                    episode_reward += reward
+                    episode_steps += 1
+
+                    if done:
+                        break
+
+                # Save video
+                if video_frames:
+                    video_path = run_dir / f"video_step_{steps_so_far}.mp4"
+                    imageio.mimwrite(video_path, video_frames, fps=30)
+                    print(f"    Video saved: {video_path}")
+                    if use_wandb and wandb.run is not None:
+                        wandb.log(
+                            {
+                                "validation/episode_reward": episode_reward,
+                                "validation/episode_steps": episode_steps,
+                                "validation/video": wandb.Video(
+                                    str(video_path), fps=30, format="mp4"
+                                ),
+                            }
+                        )
+                elif use_wandb and wandb.run is not None:
+                    wandb.log(
+                        {
+                            "validation/episode_reward": episode_reward,
+                            "validation/episode_steps": episode_steps,
+                        }
+                    )
+
+            # Save checkpoint
+            checkpoint_path = run_dir / f"model_checkpoint_{steps_so_far}.zip"
+            agent.save(str(checkpoint_path))
+            print(f"    Checkpoint saved: {checkpoint_path}")
+
+            # Log to W&B
+            if use_wandb:
+                wandb.log(
+                    {
+                        "training/timesteps": steps_so_far,
+                        "training/batch": step_count,
+                    }
+                )
+
+        # Save final model
+        final_model_path = run_dir / "model_final.zip"
+        agent.save(str(final_model_path))
+        print(f"\n✓ Training complete!")
+        print(f"  - Final model saved: {final_model_path}")
+        print(f"  - Training run: {run_dir}")
+
+        if use_wandb:
+            wandb.log(
+                {
+                    "training/final_timesteps": steps_so_far,
+                    "training/total_batches": step_count,
+                }
+            )
+            wandb.finish()
+
+    except KeyboardInterrupt:
+        print(f"\n✓ Training interrupted by user")
+        final_model_path = run_dir / "model_interrupted.zip"
+        agent.save(str(final_model_path))
+        print(f"  - Checkpoint saved: {final_model_path}")
+        if use_wandb:
+            wandb.finish()
+
+    except Exception as e:
+        print(f"\n✗ Training failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        if use_wandb:
+            wandb.finish()
+
+    finally:
+        env.close()
+        print(f"\nEnvironment closed.")
+
+
+def main():
+    """Main training entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DexPoint training script")
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="two_blocks_on_platform",
+        choices=["grasping", "two_blocks_on_platform"],
+        help="Task to train on",
+    )
+    parser.add_argument("--steps", type=int, default=10000, help="Total training steps")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for PPO")
+    parser.add_argument("--epochs", type=int, default=10, help="Epochs per PPO update")
+    parser.add_argument(
+        "--verbose", type=int, default=1, choices=[0, 1], help="Verbosity level"
+    )
+    parser.add_argument(
+        "--wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        default=True,
+        help="Record training videos (default: True)",
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_false",
+        dest="record_video",
+        help="Disable video recording",
+    )
+    parser.add_argument(
+        "--video-interval",
+        type=int,
+        default=20000,
+        help="Record video every N timesteps",
+    )
+
+    args = parser.parse_args()
+
+    train_dexpoint(
+        task_name=args.task,
+        total_timesteps=args.steps,
+        learning_rate=args.lr,
+        batch_size=args.batch_size,
+        n_epochs=args.epochs,
+        verbose=args.verbose,
+        use_wandb=args.wandb,
+        record_video=args.record_video,
+        video_interval=args.video_interval,
+    )
+
+
+if __name__ == "__main__":
+    main()
