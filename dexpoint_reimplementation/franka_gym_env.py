@@ -13,6 +13,10 @@ import imageio
 from manipulation import FrankaEnvironment
 from manipulation.perception import MujocoCamera
 from manipulation.symbolic.domains.blocks import BlocksDomain, BlocksStateManager
+from pointcloud_observation import (
+    collect_fused_pointcloud,
+    center_and_sample_pointcloud,
+)
 
 
 class FrankaGymEnvironment(gym.Env):
@@ -197,60 +201,25 @@ class FrankaGymEnvironment(gym.Env):
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Extract point cloud and proprioceptive observations from all cameras."""
-        all_points = []
-
-        # Number of samples per camera (distributed evenly)
-        samples_per_camera = 15 * self.num_points
-
         bounds = self.domain.get_working_bounds()
         info = self.domain.get_domain_info()
-        min_x = bounds["min_x"]
-        max_x = bounds["max_x"]
-        min_y = bounds["min_y"]
-        max_y = bounds["max_y"]
-        min_z = info["table_height"]
+        merged_points = collect_fused_pointcloud(
+            self.env,
+            self.camera,
+            camera_names=self.camera_names,
+            num_points=self.num_points,
+            camera_height=self.camera_height,
+            camera_width=self.camera_width,
+            workspace_bounds=bounds,
+            table_height=info["table_height"],
+        )
 
-        hand_id = self.env.model.body("hand").id
-        hand_pos = self.env.data.xpos[hand_id]
-        sphere_radius = 0.12
-
-        for camera_name in self.camera_names:
-            points, colors, pixels, depths = self.camera.get_pointcloud(
-                camera_name,
-                width=self.camera_width,
-                height=self.camera_height,
-                num_samples=samples_per_camera,
-                min_depth=0.1,  # minimum distance from camera
-                max_depth=3.0,  # maximum distance from camera
-            )
-
-            if len(points) > 0:
-                # Keep only points inside XY workspace
-                workspace_mask = (
-                    (points[:, 0] >= min_x)
-                    & (points[:, 0] <= max_x)
-                    & (points[:, 1] >= min_y)
-                    & (points[:, 1] <= max_y)
-                    & (points[:, 2] > (min_z + 0.01))
-                    & (points[:, 2] < min_z + 0.2)
-                )
-
-                dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
-                hand_mask = dist_to_hand < sphere_radius
-
-                # Combine both regions
-                mask = workspace_mask | hand_mask
-
-                points = points[mask]
-
-                if len(points) > 0:
-                    all_points.append(points)
-
-        # check if there are arrays to stack
-        if len(all_points) == 0:
+        if len(merged_points) == 0:
             hand_id = self.env.model.body("hand").id
             hand_pos = self.env.data.xpos[hand_id].copy()
-            max_joint_speed = float(np.max(np.abs(self.env.data.qvel[: self.robot_dof])))
+            max_joint_speed = float(
+                np.max(np.abs(self.env.data.qvel[: self.robot_dof]))
+            )
             print(
                 "[FrankaGymEnvironment] no valid points "
                 f"step={self.step_count} hand_pos={np.array2string(hand_pos, precision=3)} "
@@ -274,26 +243,7 @@ class FrankaGymEnvironment(gym.Env):
 
             return None
 
-        else:
-            merged_points = np.vstack(all_points)
-
-        # Center point cloud to origin (subtract mean of actual points)
-        pointcloud_mean = merged_points.mean(axis=0)
-        merged_points_centered = (merged_points - pointcloud_mean).astype(np.float32)
-
-        if len(merged_points_centered) > self.num_points:
-            # Random sampling to reduce to target size
-            indices = np.random.choice(
-                len(merged_points_centered), size=self.num_points, replace=False
-            )
-            pointcloud = merged_points_centered[indices]
-        else:
-            # Pad with zeros if not enough points
-            pointcloud = merged_points_centered
-            if len(pointcloud) < self.num_points:
-                pad_size = self.num_points - len(pointcloud)
-                padding = np.zeros((pad_size, 3), dtype=np.float32)
-                pointcloud = np.vstack([pointcloud, padding])
+        pointcloud = center_and_sample_pointcloud(merged_points, self.num_points)
 
         # Extract joint state (positions only)
         joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
