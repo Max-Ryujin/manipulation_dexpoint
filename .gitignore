@@ -68,3 +68,5 @@ notes.md
 dexart_baselines/*
 output/
 slurm
+data/
+log/
