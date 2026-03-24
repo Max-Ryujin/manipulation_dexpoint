@@ -27,7 +27,13 @@ from dexart_baselines.stable_baselines3.common.policies import (
 class PointNetExtractor(nn.Module):
     """PointNet feature extractor wrapper for point clouds."""
 
-    def __init__(self, pointnet_variant: str = "medium", output_dim: int = 256):
+    def __init__(
+        self,
+        pointnet_variant: str = "medium",
+        output_dim: int = 256,
+        checkpoint_path: Optional[str] = None,
+        freeze: bool = False,
+    ):
         """
         Initialize PointNet extractor.
 
@@ -47,6 +53,42 @@ class PointNetExtractor(nn.Module):
             raise ValueError(f"Unknown PointNet variant: {pointnet_variant}")
 
         self.output_dim = output_dim
+
+        if checkpoint_path is not None:
+            self._load_checkpoint(checkpoint_path)
+
+        if freeze:
+            for parameter in self.pointnet.parameters():
+                parameter.requires_grad = False
+
+    def _load_checkpoint(self, checkpoint_path: str) -> None:
+        checkpoint = th.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        expected_keys = set(self.pointnet.state_dict().keys())
+
+        candidate_state_dicts = [state_dict]
+        for prefix in ("module.", "encoder.", "pointnet.", "pointnet_extractor.pointnet."):
+            stripped = {}
+            changed = False
+            for key, value in state_dict.items():
+                if key.startswith(prefix):
+                    stripped[key[len(prefix) :]] = value
+                    changed = True
+                else:
+                    stripped[key] = value
+            if changed:
+                candidate_state_dicts.append(stripped)
+
+        for candidate in candidate_state_dicts:
+            if expected_keys.issubset(candidate.keys()):
+                filtered_candidate = {key: candidate[key] for key in expected_keys}
+                self.pointnet.load_state_dict(filtered_candidate, strict=True)
+                print(f"Loaded pretrained PointNet weights from {checkpoint_path}")
+                return
+
+        raise RuntimeError(
+            f"Checkpoint at {checkpoint_path} does not match PointNet {type(self.pointnet).__name__}"
+        )
 
     def forward(self, pointcloud: th.Tensor) -> th.Tensor:
         """
@@ -107,6 +149,8 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         pointnet_variant: str = "medium",
         pointnet_output_dim: int = 256,
         proprioceptive_output_dim: int = 64,
+        pointnet_checkpoint_path: Optional[str] = None,
+        freeze_pointnet: bool = False,
     ):
         """
         Initialize DexPoint features extractor.
@@ -141,6 +185,8 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         self.pointnet_extractor = PointNetExtractor(
             pointnet_variant=pointnet_variant,
             output_dim=pointnet_output_dim,
+            checkpoint_path=pointnet_checkpoint_path,
+            freeze=freeze_pointnet,
         )
 
         # Initialize MLP for proprioceptive state
@@ -205,6 +251,8 @@ class DexPointPolicy(ActorCriticPolicy):
         pointnet_variant: str = "medium",
         pointnet_output_dim: int = 256,
         proprioceptive_output_dim: int = 64,
+        pointnet_checkpoint_path: Optional[str] = None,
+        freeze_pointnet: bool = False,
     ):
         """
         Initialize DexPoint policy.
@@ -239,6 +287,8 @@ class DexPointPolicy(ActorCriticPolicy):
                 "pointnet_variant": pointnet_variant,
                 "pointnet_output_dim": pointnet_output_dim,
                 "proprioceptive_output_dim": proprioceptive_output_dim,
+                "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "freeze_pointnet": freeze_pointnet,
             }
         )
 
@@ -278,6 +328,8 @@ def create_dexpoint_policy(
     lr_schedule,
     pointnet_variant: str = "medium",
     net_arch: Optional[List[Union[int, Dict[str, List[int]]]]] = None,
+    pointnet_checkpoint_path: Optional[str] = None,
+    freeze_pointnet: bool = False,
     **kwargs,
 ) -> DexPointPolicy:
     """
@@ -300,5 +352,7 @@ def create_dexpoint_policy(
         lr_schedule=lr_schedule,
         net_arch=net_arch,
         pointnet_variant=pointnet_variant,
+        pointnet_checkpoint_path=pointnet_checkpoint_path,
+        freeze_pointnet=freeze_pointnet,
         **kwargs,
     )
