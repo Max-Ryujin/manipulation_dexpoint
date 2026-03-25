@@ -2,6 +2,7 @@
 
 import imageio
 import numpy as np
+import argparse
 from pathlib import Path
 import json
 from datetime import datetime
@@ -80,6 +81,7 @@ def create_output_dir():
 
 def train_dexpoint(
     task_name: str = "grasping",
+    agent_name: str = "ppo",
     total_timesteps: int = 100000,
     learning_rate: float = 3e-4,
     batch_size: int = 64,
@@ -94,14 +96,15 @@ def train_dexpoint(
     freeze_pointnet: bool = False,
 ):
     """
-    Train DexPoint policy using PPO.
+    Train a DexPoint policy using PPO or A2C.
 
     Args:
         task_name: Task to train on
+        agent_name: RL algorithm to train with
         total_timesteps: Total training timesteps
         learning_rate: Learning rate for Adam optimizer
         batch_size: Batch size for PPO updates
-        n_epochs: Number of policy update epochs per rollout
+        n_epochs: Number of PPO policy update epochs per rollout
         n_steps: Number of steps to collect per update
         save_interval: Save model every N timesteps
         verbose: Verbosity level (0=silent, 1=verbose)
@@ -109,7 +112,7 @@ def train_dexpoint(
         record_video: Record training videos
         video_interval: Record video every N timesteps
         pointnet_checkpoint_path: Optional SimSiam encoder checkpoint
-        freeze_pointnet: Whether to keep PointNet frozen during PPO
+        freeze_pointnet: Whether to keep PointNet frozen during RL training
     """
     print("\n" + "=" * 70)
     print("DexPoint Training - Franka Manipulation")
@@ -121,6 +124,7 @@ def train_dexpoint(
             name=f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config={
                 "task": task_name,
+                "agent": agent_name,
                 "total_timesteps": total_timesteps,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
@@ -163,13 +167,16 @@ def train_dexpoint(
     env.configure_task(task_config)
     print(f"✓ Environment ready")
     print(f"  - Task: {task_name}")
+    print(f"  - Agent: {agent_name.upper()}")
     print(f"  - Observation space: {env.observation_space}")
     print(f"  - Action space: {env.action_space}")
 
-    # Create PPO agent
-    print(f"\n Creating PPO agent...")
+    # Create training agent
+    print(f"\n Creating {agent_name.upper()} agent...")
 
-    if args.agent == "ppo":
+    agent = None
+
+    if agent_name == "ppo":
         agent = PPO(
             policy=DexPointPolicy,
             env=env,
@@ -204,7 +211,7 @@ def train_dexpoint(
             ),
         )
         print(f"|PPO agent created")
-    elif args.agent == "a2c":
+    elif agent_name == "a2c":
         agent = A2C(
             policy=DexPointPolicy,
             env=env,
@@ -228,11 +235,13 @@ def train_dexpoint(
         print(f"|A2C agent created")
 
     if agent is None:
+        print(f"Unsupported agent: {agent_name}")
         env.close()
         return
 
     # Training configuration
     print(f"\n Training configuration:")
+    print(f"  - Agent: {agent_name.upper()}")
     print(f"  - Total timesteps: {total_timesteps}")
     print(f"  - Learning rate: {learning_rate}")
     print(f"  - Batch size: {batch_size}")
@@ -243,6 +252,7 @@ def train_dexpoint(
     # Save training config
     config = {
         "task": task_name,
+        "agent": agent_name,
         "total_timesteps": total_timesteps,
         "learning_rate": learning_rate,
         "batch_size": batch_size,
@@ -397,7 +407,6 @@ def train_dexpoint(
 
 def main():
     """Main training entry point."""
-    import argparse
 
     parser = argparse.ArgumentParser(description="DexPoint training script")
     parser.add_argument(
@@ -407,9 +416,18 @@ def main():
         choices=["grasping"],
         help="Task to train on",
     )
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="ppo",
+        choices=["ppo", "a2c"],
+        help="RL algorithm to train with",
+    )
     parser.add_argument("--steps", type=int, default=10000, help="Total training steps")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for PPO")
+    parser.add_argument(
+        "--batch-size", type=int, default=64, help="Batch size for PPO updates"
+    )
     parser.add_argument("--epochs", type=int, default=10, help="Epochs per PPO update")
     parser.add_argument(
         "--verbose", type=int, default=1, choices=[0, 1], help="Verbosity level"
@@ -448,13 +466,14 @@ def main():
     parser.add_argument(
         "--freeze-pointnet",
         action="store_true",
-        help="Freeze the pretrained PointNet encoder during PPO training.",
+        help="Freeze the pretrained PointNet encoder during RL training.",
     )
 
     args = parser.parse_args()
 
     train_dexpoint(
         task_name=args.task,
+        agent_name=args.agent,
         total_timesteps=args.steps,
         learning_rate=args.lr,
         batch_size=args.batch_size,
