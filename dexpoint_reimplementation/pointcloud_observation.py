@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence
 
+import mujoco
 import numpy as np
-
-from manipulation.symbolic.domains.blocks import BlocksDomain
 
 
 DEFAULT_CAMERA_NAMES = ("top_camera", "side_camera", "front_camera")
@@ -24,15 +23,41 @@ def get_workspace_configuration(
     table_body_name: str = "simple_table",
     table_geom_name: str = "table_surface",
 ) -> tuple[dict[str, float], dict[str, object]]:
-    domain = BlocksDomain(
-        model,
-        working_area=working_area,
-        offset_x=offset_x,
-        offset_y=offset_y,
-        table_body_name=table_body_name,
-        table_geom_name=table_geom_name,
-    )
-    return domain.get_working_bounds(), domain.get_domain_info()
+    temp_data = mujoco.MjData(model)
+    mujoco.mj_forward(model, temp_data)
+
+    table_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, table_geom_name)
+    if table_geom_id < 0:
+        raise ValueError(f"Could not find table geom '{table_geom_name}' in model")
+
+    geom_xpos = temp_data.geom_xpos[table_geom_id]
+    geom_size = model.geom_size[table_geom_id]
+
+    center_x = float(geom_xpos[0] + offset_x)
+    center_y = float(geom_xpos[1] - geom_size[1] + working_area[1] / 2.0 + offset_y)
+    table_height = float(geom_xpos[2] + geom_size[2])
+
+    half_width_x = working_area[0] / 2.0
+    half_width_y = working_area[1] / 2.0
+
+    bounds = {
+        "min_x": center_x - half_width_x,
+        "max_x": center_x + half_width_x,
+        "min_y": center_y - half_width_y,
+        "max_y": center_y + half_width_y,
+        "table_height": table_height,
+    }
+    info = {
+        "type": "tabletop",
+        "working_area": working_area,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "table_body_name": table_body_name,
+        "table_geom_name": table_geom_name,
+        "table_bounds": bounds,
+        "table_height": table_height,
+    }
+    return bounds, info
 
 
 def collect_fused_pointcloud(
@@ -103,7 +128,7 @@ def collect_fused_pointcloud(
 def center_and_sample_pointcloud(
     merged_points: np.ndarray,
     num_points: int,
-    rng: np.random.Generator | None = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
     if len(merged_points) == 0:
         return np.zeros((num_points, 3), dtype=np.float32)

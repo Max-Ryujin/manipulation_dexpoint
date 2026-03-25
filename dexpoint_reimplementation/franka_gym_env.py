@@ -1,21 +1,28 @@
 """Gym Environment wrapper for Franka robot with point cloud observations."""
 
-import numpy as np
-import gym
-from gym import spaces
-from typing import Dict, Tuple, Optional, Any, List
-from pathlib import Path
-import cv2
+import math
 from collections import deque
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import gym
 import imageio
+import numpy as np
+from gym import spaces
 
 from manipulation import FrankaEnvironment
 from manipulation.perception import MujocoCamera
-from manipulation.symbolic.domains.blocks import BlocksDomain, BlocksStateManager
 from pointcloud_observation import (
-    collect_fused_pointcloud,
     center_and_sample_pointcloud,
+    collect_fused_pointcloud,
+    get_workspace_configuration,
+)
+from ycb_scene import (
+    DEFAULT_YCB_OBJECT_ROOT,
+    ensure_single_object_ycb_scene,
+    load_ycb_object_spec,
 )
 
 
@@ -28,16 +35,18 @@ class FrankaGymEnvironment(gym.Env):
 
     def __init__(
         self,
-        xml_path: str,
-        task_name: str = "blocks_world",
+        xml_path: Optional[str] = None,
+        task_name: str = "grasping",
         num_points: int = 512,
         camera_height: int = 480,
         camera_width: int = 640,
         camera_names: Optional[list] = None,
         rate: float = 200.0,
         frame_skip: int = 10,
-        randomize_blocks: bool = True,
-        n_blocks_to_place: int = 3,
+        randomize_target_pose: bool = True,
+        ycb_object_root: str = DEFAULT_YCB_OBJECT_ROOT.as_posix(),
+        target_body_name: str = "target_object",
+        target_drop_height_range: Tuple[float, float] = (0.0, 0.03),
         visualize_pointclouds: bool = False,
         pointcloud_point_size: int = 1,
         pointcloud_alpha: float = 0.2,
@@ -47,32 +56,44 @@ class FrankaGymEnvironment(gym.Env):
 
         Args:
             xml_path: Path to MuJoCo XML scene file
-            task_name: Task identifier ('blocks_world' or 'grasping')
+            task_name: Task identifier
             num_points: Target number of points in merged point cloud
             camera_height: Camera render height (pixels)
             camera_width: Camera render width (pixels)
             camera_names: List of camera names to use. If None, uses defaults.
             rate: Simulation frequency (Hz)
-            randomize_blocks: Whether to randomize block placement each episode
-            n_blocks_to_place: Number of blocks to place on table (default: 2)
+            randomize_target_pose: Whether to randomize can placement each episode
+            ycb_object_root: Path to the YCB object directory to load into the scene
+            target_body_name: Body name used for the grasp target inside MuJoCo
+            target_drop_height_range: Extra randomized drop height range above table
             visualize_pointclouds: Whether to visualize point clouds in render output
             pointcloud_point_size: Size of rendered point cloud dots in pixels (default: 4)
             pointcloud_alpha: Transparency of point cloud overlay (0-1, default: 0.7)
         """
-        self.xml_path = xml_path
         self.task_name = task_name
         self.num_points = num_points
         self.camera_height = camera_height
         self.camera_width = camera_width
         self.rate = rate
         self.frame_skip = frame_skip
-        self.randomize_blocks = randomize_blocks
-        self.n_blocks_to_place = n_blocks_to_place
+        self.randomize_target_pose = randomize_target_pose
         self.visualize_pointclouds = visualize_pointclouds
         self.pointcloud_point_size = pointcloud_point_size
         self.pointcloud_alpha = pointcloud_alpha
         self.robot_dof = 8
         self.joint_dim = self.robot_dof
+        self.target_body_name = target_body_name
+        self.target_drop_height_range = target_drop_height_range
+        self._rng = np.random.default_rng()
+
+        self.ycb_object_root = Path(ycb_object_root).resolve()
+        self.target_spec = load_ycb_object_spec(self.ycb_object_root)
+
+        if xml_path is None:
+            scene_xml_path, _ = ensure_single_object_ycb_scene(self.ycb_object_root)
+            self.xml_path = scene_xml_path.as_posix()
+        else:
+            self.xml_path = xml_path
 
         # Set default camera names if not provided
         if camera_names is None:
@@ -81,15 +102,24 @@ class FrankaGymEnvironment(gym.Env):
             self.camera_names = camera_names
 
         # Initialize environment
-        self.env = FrankaEnvironment(xml_path, rate=rate, frame_skip=self.frame_skip)
+        self.env = FrankaEnvironment(
+            self.xml_path, rate=rate, frame_skip=self.frame_skip
+        )
         self.camera = MujocoCamera(self.env, width=camera_width, height=camera_height)
 
         self.ctrl_min = self.env.model.actuator_ctrlrange[: self.robot_dof, 0]
         self.ctrl_max = self.env.model.actuator_ctrlrange[: self.robot_dof, 1]
 
-        # Initialize blocks domain and state manager for randomized block placement
-        self.domain = BlocksDomain(self.env.model)
-        self.state_manager = BlocksStateManager(self.domain, self.env)
+        self.workspace_bounds, self.workspace_info = get_workspace_configuration(
+            self.env.model
+        )
+        self.table_height = float(self.workspace_info["table_height"])
+        self.target_rest_height = self.table_height + float(
+            self.target_spec.half_extents[2]
+        )
+        self.success_lift_height = 0.08
+
+        self.env.add_collision_exception(self.target_body_name)
 
         # Observation space: Dict with point cloud + joint state
         self.observation_space = spaces.Dict(
@@ -119,17 +149,18 @@ class FrankaGymEnvironment(gym.Env):
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
         self.env.reset()
+        self.env.clear_collision_exceptions()
+        self.env.add_collision_exception(self.target_body_name)
 
-        # Load blocks based on task configuration
-        if self.state_manager is not None:
-
-            self.state_manager.sample_random_state(
-                n_blocks=self.n_blocks_to_place, include_platforms=True
-            )
+        if self.randomize_target_pose:
+            self._reset_target_pose()
 
         # Step a few times to settle simulation
         for _ in range(10):
             self.env.step()
+
+        target_pos = self.get_target_position()
+        self.target_rest_height = float(target_pos[2])
 
         self.step_count = 0
 
@@ -139,6 +170,50 @@ class FrankaGymEnvironment(gym.Env):
 
         obs = self._get_observation()
         return obs
+
+    def _reset_target_pose(self) -> None:
+        bounds = self.workspace_bounds
+        placement_margin = float(self.target_spec.placement_radius + 0.02)
+
+        min_x = bounds["min_x"] + placement_margin
+        max_x = bounds["max_x"] - placement_margin
+        min_y = bounds["min_y"] + placement_margin
+        max_y = bounds["max_y"] - placement_margin
+
+        if min_x >= max_x:
+            x = 0.5 * (bounds["min_x"] + bounds["max_x"])
+        else:
+            x = float(self._rng.uniform(min_x, max_x))
+
+        if min_y >= max_y:
+            y = 0.5 * (bounds["min_y"] + bounds["max_y"])
+        else:
+            y = float(self._rng.uniform(min_y, max_y))
+
+        drop_height = float(
+            self._rng.uniform(
+                self.target_drop_height_range[0], self.target_drop_height_range[1]
+            )
+        )
+        z = self.table_height + float(self.target_spec.half_extents[2]) + drop_height
+        yaw = float(self._rng.uniform(-math.pi, math.pi))
+        quat = np.array(
+            [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)], dtype=np.float64
+        )
+
+        self.env.set_object_pose(
+            self.target_body_name,
+            pos=np.array([x, y, z], dtype=np.float64),
+            quat=quat,
+        )
+        self.env.reset_velocities()
+        self.env.forward()
+
+    def get_target_position(self) -> np.ndarray:
+        return self.env.get_object_position(self.target_body_name)
+
+    def get_target_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.env.get_object_pose(self.target_body_name)
 
     def step(
         self, action: np.ndarray
@@ -201,8 +276,6 @@ class FrankaGymEnvironment(gym.Env):
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Extract point cloud and proprioceptive observations from all cameras."""
-        bounds = self.domain.get_working_bounds()
-        info = self.domain.get_domain_info()
         merged_points = collect_fused_pointcloud(
             self.env,
             self.camera,
@@ -210,8 +283,8 @@ class FrankaGymEnvironment(gym.Env):
             num_points=self.num_points,
             camera_height=self.camera_height,
             camera_width=self.camera_width,
-            workspace_bounds=bounds,
-            table_height=info["table_height"],
+            workspace_bounds=self.workspace_bounds,
+            table_height=self.table_height,
         )
 
         if len(merged_points) == 0:
@@ -283,11 +356,8 @@ class FrankaGymEnvironment(gym.Env):
         """
         self.task_config = task_config
         self.max_episode_steps = task_config.get("max_episode_steps", 500)
-        self.n_blocks_to_place = task_config.get(
-            "n_blocks_to_place", self.n_blocks_to_place
-        )
-        self.randomize_blocks = task_config.get(
-            "randomize_blocks", self.randomize_blocks
+        self.randomize_target_pose = task_config.get(
+            "randomize_target_pose", self.randomize_target_pose
         )
 
     def set_task_reward(self, reward_fn):
@@ -365,13 +435,11 @@ class FrankaGymEnvironment(gym.Env):
                 max_depth=3.0,
             )
 
-            bounds = self.domain.get_working_bounds()
-            info = self.domain.get_domain_info()
-            min_x = bounds["min_x"]
-            max_x = bounds["max_x"]
-            min_y = bounds["min_y"]
-            max_y = bounds["max_y"]
-            min_z = info["table_height"]
+            min_x = self.workspace_bounds["min_x"]
+            max_x = self.workspace_bounds["max_x"]
+            min_y = self.workspace_bounds["min_y"]
+            max_y = self.workspace_bounds["max_y"]
+            min_z = self.table_height
 
             hand_id = self.env.model.body("hand").id
             hand_pos = self.env.data.xpos[hand_id]
@@ -402,8 +470,9 @@ class FrankaGymEnvironment(gym.Env):
 
             order = np.argsort(depths)
 
-            # Create overlay image (copy of RGB)
+            # Create overlay image and a standalone point-cloud canvas.
             overlay = rgb.copy().astype(float)
+            pointcloud_only = np.full_like(rgb, 255, dtype=np.uint8)
 
             # Draw points in depth order
             for idx in order:
@@ -416,6 +485,13 @@ class FrankaGymEnvironment(gym.Env):
                     tuple(int(c) for c in colors[idx]),
                     -1,
                 )
+                cv2.circle(
+                    pointcloud_only,
+                    (int(u), int(v)),
+                    self.pointcloud_point_size,
+                    tuple(int(c) for c in colors[idx]),
+                    -1,
+                )
 
             # Blend overlay with original RGB using alpha
             rgb_out = (
@@ -423,7 +499,7 @@ class FrankaGymEnvironment(gym.Env):
                 + (1 - self.pointcloud_alpha) * rgb.astype(float)
             ).astype(np.uint8)
 
-            return rgb_out
+            return np.concatenate([rgb_out, pointcloud_only], axis=1)
 
         except Exception as e:
             print(f"Warning: Failed to render point cloud overlay: {e}")

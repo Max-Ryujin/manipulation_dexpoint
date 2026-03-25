@@ -1,5 +1,10 @@
 """MuJoCo camera rendering and pointcloud generation utilities."""
 
+import os
+
+if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
+    os.environ["MUJOCO_GL"] = "egl"
+
 import cv2
 import mujoco
 import numpy as np

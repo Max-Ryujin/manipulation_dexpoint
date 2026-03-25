@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 from datetime import datetime
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 import wandb
 
 # Add dexart to path
@@ -19,15 +19,17 @@ import dexart_baselines.stable_baselines3  # noqa: F401
 from franka_gym_env import FrankaGymEnvironment
 from tasks import create_task_config
 from training_callbacks import TaskInfoLoggingCallback
+from ycb_scene import DEFAULT_YCB_OBJECT_ROOT
 
 if TYPE_CHECKING:
     from dexart_baselines.stable_baselines3.ppo import PPO
+    from dexart_baselines.stable_baselines3.a2c import A2C
     from dexart_baselines.stable_baselines3.common.policies import (
         MultiInputActorCriticPolicy,
     )
 else:
-    # Import PPO from the local stable_baselines3 fork via the registered alias.
     from stable_baselines3.ppo import PPO
+    from stable_baselines3.a2c import A2C
     from stable_baselines3.common.policies import (
         MultiInputActorCriticPolicy,
     )
@@ -58,14 +60,8 @@ def add_batch_dimension(obs):
 
 
 _HERE = Path(__file__).parent
-_BLOCKS_XML = (
-    _HERE
-    / ".."
-    / "manipulation"
-    / "environments"
-    / "assets"
-    / "franka_emika_panda"
-    / "scene_blocks.xml"
+_DEFAULT_POINTNET_CHECKPOINT = (
+    _HERE / ".." / "log" / "simsiam" / "ycb" / "ycb_medium" / "simsiam_pn_30.pth"
 )
 _OUTPUT_DIR = _HERE / "training_runs"
 
@@ -83,7 +79,7 @@ def create_output_dir():
 
 
 def train_dexpoint(
-    task_name: str = "two_blocks_on_platform",
+    task_name: str = "grasping",
     total_timesteps: int = 100000,
     learning_rate: float = 3e-4,
     batch_size: int = 64,
@@ -94,12 +90,14 @@ def train_dexpoint(
     use_wandb: bool = False,
     record_video: bool = True,
     video_interval: int = 20000,
+    pointnet_checkpoint_path: Optional[str] = None,
+    freeze_pointnet: bool = False,
 ):
     """
     Train DexPoint policy using PPO.
 
     Args:
-        task_name: Task to train on ("two_blocks_on_platform" or "grasping")
+        task_name: Task to train on
         total_timesteps: Total training timesteps
         learning_rate: Learning rate for Adam optimizer
         batch_size: Batch size for PPO updates
@@ -110,6 +108,8 @@ def train_dexpoint(
         use_wandb: Enable Weights & Biases logging
         record_video: Record training videos
         video_interval: Record video every N timesteps
+        pointnet_checkpoint_path: Optional SimSiam encoder checkpoint
+        freeze_pointnet: Whether to keep PointNet frozen during PPO
     """
     print("\n" + "=" * 70)
     print("DexPoint Training - Franka Manipulation")
@@ -129,6 +129,8 @@ def train_dexpoint(
                 "save_interval": save_interval,
                 "video_interval": video_interval,
                 "pointcloud_points": 512,
+                "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "freeze_pointnet": freeze_pointnet,
             },
         )
 
@@ -139,8 +141,9 @@ def train_dexpoint(
     # Create environment
     print(f"\n Creating environment...")
     env = FrankaGymEnvironment(
-        xml_path=_BLOCKS_XML.as_posix(),
+        xml_path=None,
         task_name=task_name,
+        ycb_object_root=DEFAULT_YCB_OBJECT_ROOT.as_posix(),
         num_points=512,
         camera_height=480,
         camera_width=640,
@@ -152,7 +155,11 @@ def train_dexpoint(
     )
 
     # Configure task
-    task_config = create_task_config(task_name, max_episode_steps=1000)
+    task_config = create_task_config(
+        task_name,
+        max_episode_steps=1000,
+        target_body_name=env.target_body_name,
+    )
     env.configure_task(task_config)
     print(f"✓ Environment ready")
     print(f"  - Task: {task_name}")
@@ -162,7 +169,7 @@ def train_dexpoint(
     # Create PPO agent
     print(f"\n Creating PPO agent...")
 
-    try:
+    if args.agent == "ppo":
         agent = PPO(
             policy=DexPointPolicy,
             env=env,
@@ -182,8 +189,11 @@ def train_dexpoint(
             target_kl=None,
             create_eval_env=True,
             policy_kwargs={
-                #"net_arch": [dict(pi=[256, 256], vf=[256, 256])],
+                # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+                "pointnet_variant": "medium",
+                "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "freeze_pointnet": freeze_pointnet,
             },
             verbose=verbose,
             wandb_project="dexpoint-franka" if use_wandb else None,
@@ -194,9 +204,28 @@ def train_dexpoint(
             ),
         )
         print(f"|PPO agent created")
-    except Exception as e:
-        print(f"Failed to create PPO agent: {e}")
-        agent = None
+    elif args.agent == "a2c":
+        agent = A2C(
+            policy=DexPointPolicy,
+            env=env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            gamma=0.99,
+            gae_lambda=0.95,
+            max_grad_norm=0.5,
+            use_sde=False,
+            sde_sample_freq=-1,
+            create_eval_env=True,
+            policy_kwargs={
+                # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
+                "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+                "pointnet_variant": "medium",
+                "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "freeze_pointnet": freeze_pointnet,
+            },
+            verbose=verbose,
+        )
+        print(f"|A2C agent created")
 
     if agent is None:
         env.close()
@@ -226,8 +255,11 @@ def train_dexpoint(
         "env_config": {
             "num_points": 512,
             "camera_names": ["top_camera", "side_camera", "front_camera"],
-            "n_blocks_to_place": env.n_blocks_to_place,
+            "target_body_name": env.target_body_name,
+            "ycb_object_root": env.ycb_object_root.as_posix(),
         },
+        "pointnet_checkpoint_path": pointnet_checkpoint_path,
+        "freeze_pointnet": freeze_pointnet,
     }
 
     config_path = run_dir / "config.json"
@@ -371,8 +403,8 @@ def main():
     parser.add_argument(
         "--task",
         type=str,
-        default="two_blocks_on_platform",
-        choices=["grasping", "two_blocks_on_platform"],
+        default="grasping",
+        choices=["grasping"],
         help="Task to train on",
     )
     parser.add_argument("--steps", type=int, default=10000, help="Total training steps")
@@ -403,6 +435,21 @@ def main():
         default=20000,
         help="Record video every N timesteps",
     )
+    parser.add_argument(
+        "--pointnet-checkpoint",
+        type=str,
+        default=(
+            _DEFAULT_POINTNET_CHECKPOINT.as_posix()
+            if _DEFAULT_POINTNET_CHECKPOINT.exists()
+            else None
+        ),
+        help="Path to a pretrained PointNet encoder checkpoint.",
+    )
+    parser.add_argument(
+        "--freeze-pointnet",
+        action="store_true",
+        help="Freeze the pretrained PointNet encoder during PPO training.",
+    )
 
     args = parser.parse_args()
 
@@ -416,6 +463,8 @@ def main():
         use_wandb=args.wandb,
         record_video=args.record_video,
         video_interval=args.video_interval,
+        pointnet_checkpoint_path=args.pointnet_checkpoint,
+        freeze_pointnet=args.freeze_pointnet,
     )
 
 
