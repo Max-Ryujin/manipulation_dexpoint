@@ -17,7 +17,7 @@ def get_default_camera_names() -> list[str]:
 
 def get_workspace_configuration(
     model,
-    working_area: tuple[float, float] = (0.4, 0.4),
+    working_area: tuple[float, float] = (0.45, 0.45),
     offset_x: float = 0.0,
     offset_y: float = 0.0,
     table_body_name: str = "simple_table",
@@ -78,7 +78,7 @@ def collect_fused_pointcloud(
     hand_sphere_radius: float = 0.12,
 ) -> np.ndarray:
     all_points: list[np.ndarray] = []
-    samples_per_camera = 20 * num_points
+    samples_per_camera = 50 * num_points
 
     min_x = workspace_bounds["min_x"]
     max_x = workspace_bounds["max_x"]

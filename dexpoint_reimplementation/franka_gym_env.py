@@ -457,7 +457,7 @@ class FrankaGymEnvironment(gym.Env):
 
             # Get point cloud for this camera
             # Use only the points from this specific camera to avoid confusion
-            samples_per_camera = 15 * self.num_points
+            samples_per_camera = 50 * self.num_points
             points, colors, pixels, depths = self.camera.get_pointcloud(
                 camera_name,
                 width=self.camera_width,
