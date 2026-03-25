@@ -94,6 +94,7 @@ def train_dexpoint(
     video_interval: int = 20000,
     pointnet_checkpoint_path: Optional[str] = None,
     freeze_pointnet: bool = False,
+    wandb_run_name: Optional[str] = None,
 ):
     """
     Train a DexPoint policy using PPO or A2C.
@@ -113,15 +114,20 @@ def train_dexpoint(
         video_interval: Record video every N timesteps
         pointnet_checkpoint_path: Optional SimSiam encoder checkpoint
         freeze_pointnet: Whether to keep PointNet frozen during RL training
+        wandb_run_name: Optional explicit Weights & Biases run name
     """
     print("\n" + "=" * 70)
     print("DexPoint Training - Franka Manipulation")
     print("=" * 70)
 
+    resolved_wandb_run_name = wandb_run_name or (
+        f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+
     if use_wandb:
         wandb.init(
             project="dexpoint-franka",
-            name=f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=resolved_wandb_run_name,
             config={
                 "task": task_name,
                 "agent": agent_name,
@@ -135,6 +141,7 @@ def train_dexpoint(
                 "pointcloud_points": 512,
                 "pointnet_checkpoint_path": pointnet_checkpoint_path,
                 "freeze_pointnet": freeze_pointnet,
+                "wandb_run_name": resolved_wandb_run_name,
             },
         )
 
@@ -204,11 +211,7 @@ def train_dexpoint(
             },
             verbose=verbose,
             wandb_project="dexpoint-franka" if use_wandb else None,
-            wandb_run_name=(
-                f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                if use_wandb
-                else None
-            ),
+            wandb_run_name=resolved_wandb_run_name if use_wandb else None,
         )
         print(f"|PPO agent created")
     elif agent_name == "a2c":
@@ -262,6 +265,7 @@ def train_dexpoint(
         "use_wandb": use_wandb,
         "record_video": record_video,
         "video_interval": video_interval,
+        "wandb_run_name": resolved_wandb_run_name if use_wandb else None,
         "env_config": {
             "num_points": 512,
             "camera_names": ["top_camera", "side_camera", "front_camera"],
@@ -436,6 +440,12 @@ def main():
         "--wandb", action="store_true", help="Enable Weights & Biases logging"
     )
     parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Explicit Weights & Biases run name.",
+    )
+    parser.add_argument(
         "--record-video",
         action="store_true",
         default=True,
@@ -484,6 +494,7 @@ def main():
         video_interval=args.video_interval,
         pointnet_checkpoint_path=args.pointnet_checkpoint,
         freeze_pointnet=args.freeze_pointnet,
+        wandb_run_name=args.wandb_run_name,
     )
 
 

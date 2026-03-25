@@ -145,6 +145,8 @@ class FrankaGymEnvironment(gym.Env):
         # Frame buffering for edge case debugging
         self.frame_buffer = deque(maxlen=self.max_episode_steps)
         self.episode_frames = []
+        self._last_valid_observation = self._create_empty_observation()
+        self._last_pointcloud_empty = False
 
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
@@ -167,9 +169,16 @@ class FrankaGymEnvironment(gym.Env):
         # Clear frame buffer for new episode
         self.frame_buffer.clear()
         self.episode_frames = []
+        self._last_pointcloud_empty = False
 
         obs = self._get_observation()
         return obs
+
+    def _create_empty_observation(self) -> Dict[str, np.ndarray]:
+        return {
+            "pointcloud": np.zeros((self.num_points, 3), dtype=np.float32),
+            "joint_state": np.zeros((self.joint_dim,), dtype=np.float32),
+        }
 
     def _reset_target_pose(self) -> None:
         bounds = self.workspace_bounds
@@ -260,6 +269,16 @@ class FrankaGymEnvironment(gym.Env):
         # Get observation
         obs = self._get_observation()
 
+        if self._last_pointcloud_empty:
+            info = {
+                "pointcloud_empty": True,
+                "episode_failure_reason": "empty_pointcloud",
+            }
+            done = True
+            reward = 0.0
+            self.episode_frames = []
+            return obs, reward, done, info
+
         # Compute task-specific reward and done signal
         reward, done, info = self._compute_reward_and_done()
 
@@ -314,17 +333,30 @@ class FrankaGymEnvironment(gym.Env):
                 video_path = debug_dir / f"episode_video_{timestamp}.mp4"
                 imageio.mimwrite(str(video_path), self.episode_frames, fps=30)
 
-            return None
+            self._last_pointcloud_empty = True
+            joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
+            fallback_obs = {
+                "pointcloud": self._last_valid_observation["pointcloud"].copy(),
+                "joint_state": joint_state,
+            }
+            self._last_valid_observation = fallback_obs
+            return fallback_obs
 
         pointcloud = center_and_sample_pointcloud(merged_points, self.num_points)
+        self._last_pointcloud_empty = False
 
         # Extract joint state (positions only)
         joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
 
-        return {
+        obs = {
             "pointcloud": pointcloud,
             "joint_state": joint_state,
         }
+        self._last_valid_observation = {
+            "pointcloud": pointcloud.copy(),
+            "joint_state": joint_state.copy(),
+        }
+        return obs
 
     def _compute_reward_and_done(self) -> Tuple[float, bool, Dict[str, Any]]:
         """
