@@ -164,6 +164,8 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         # Extract subspace shapes BEFORE calling super().__init__
         pointcloud_space = observation_space.spaces["pointcloud"]
         joint_state_space = observation_space.spaces["joint_state"]
+        ee_position_space = observation_space.spaces.get("ee_position")
+        goal_position_space = observation_space.spaces.get("goal_position")
 
         assert isinstance(pointcloud_space, spaces.Box), "pointcloud must be Box space"
         assert len(pointcloud_space.shape) == 2, "pointcloud must be [N, 3]"
@@ -174,6 +176,15 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         ), "joint_state must be Box space"
         assert len(joint_state_space.shape) == 1, "joint_state must be 1D"
 
+        # Proprioceptive dim = joint_state + ee_position (3) + goal_position (3)
+        proprio_input_dim = joint_state_space.shape[0]
+        if ee_position_space is not None:
+            proprio_input_dim += ee_position_space.shape[0]
+        if goal_position_space is not None:
+            proprio_input_dim += goal_position_space.shape[0]
+        self._has_ee_position = ee_position_space is not None
+        self._has_goal_position = goal_position_space is not None
+
         # Calculate total features dimension
         total_features_dim = pointnet_output_dim + proprioceptive_output_dim
 
@@ -181,7 +192,6 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim=total_features_dim)
 
         # Initialize PointNet for point clouds
-        # I cannot find a pretrained pointnet file
         self.pointnet_extractor = PointNetExtractor(
             pointnet_variant=pointnet_variant,
             output_dim=pointnet_output_dim,
@@ -189,9 +199,9 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
             freeze=freeze_pointnet,
         )
 
-        # Initialize MLP for proprioceptive state
+        # Initialize MLP for proprioceptive state (joints + ee_position + goal_position)
         self.proprioceptive_extractor = ProprioceptiveExtractor(
-            input_dim=joint_state_space.shape[0],
+            input_dim=proprio_input_dim,
             output_dim=proprioceptive_output_dim,
         )
 
@@ -203,6 +213,8 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
             observations: Dict with keys:
                 - 'pointcloud': [B, N, 3]
                 - 'joint_state': [B, joint_dim]
+                - 'ee_position': [B, 3]  (optional)
+                - 'goal_position': [B, 3]  (optional)
 
         Returns:
             combined_features: [B, features_dim]
@@ -211,9 +223,14 @@ class DexPointFeaturesExtractor(BaseFeaturesExtractor):
         pointcloud = observations["pointcloud"]
         pc_features = self.pointnet_extractor(pointcloud)
 
-        # Extract proprioceptive features
-        joint_state = observations["joint_state"]
-        proprio_features = self.proprioceptive_extractor(joint_state)
+        # Build proprioceptive vector: joints [+ ee_position] [+ goal_position]
+        proprio_parts = [observations["joint_state"]]
+        if self._has_ee_position:
+            proprio_parts.append(observations["ee_position"])
+        if self._has_goal_position:
+            proprio_parts.append(observations["goal_position"])
+        proprio_vec = th.cat(proprio_parts, dim=1)
+        proprio_features = self.proprioceptive_extractor(proprio_vec)
 
         # Concatenate all features
         combined_features = th.cat([pc_features, proprio_features], dim=1)

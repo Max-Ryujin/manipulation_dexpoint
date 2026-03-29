@@ -22,6 +22,11 @@ from dexart_baselines.pretrain.ycb.rl_pretrain_support import (
     load_ply_vertices,
 )
 
+_TEXTURED_MESH_CANDIDATES = (
+    "poisson/textured.obj",
+    "tsdf/textured.obj",
+)
+
 _ASSET_ROOT = (
     _REPO_ROOT / "manipulation" / "environments" / "assets" / "franka_emika_panda"
 )
@@ -52,6 +57,7 @@ class YCBObjectSpec:
     name: str
     object_root: Path
     mesh_path: Path
+    texture_path: Optional[Path]
     pointcloud_path: Path
     mesh_offset: np.ndarray
     half_extents: np.ndarray
@@ -82,6 +88,43 @@ def _require_element(root: ET.Element, query: str) -> ET.Element:
     return element
 
 
+def _find_visual_mesh(object_root: Path) -> Path | None:
+    for relative_path in _TEXTURED_MESH_CANDIDATES:
+        candidate = object_root / relative_path
+        if candidate.exists():
+            return candidate
+    return find_source_mesh(object_root)
+
+
+def _find_obj_texture(mesh_path: Path) -> Optional[Path]:
+    if mesh_path.suffix.lower() != ".obj":
+        return None
+
+    mtllib_path: Optional[Path] = None
+    with mesh_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("mtllib "):
+                _, relative_mtl = stripped.split(None, 1)
+                mtllib_path = (mesh_path.parent / relative_mtl).resolve()
+                break
+
+    if mtllib_path is None or not mtllib_path.exists():
+        return None
+
+    with mtllib_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("map_Kd "):
+                _, relative_texture = stripped.split(None, 1)
+                texture_path = (mtllib_path.parent / relative_texture).resolve()
+                if texture_path.exists():
+                    return texture_path
+                break
+
+    return None
+
+
 def _find_dynamic_material(root: ET.Element) -> ET.Element:
     asset = _require_element(root, ".//asset")
     for material in asset.findall("material"):
@@ -90,15 +133,25 @@ def _find_dynamic_material(root: ET.Element) -> ET.Element:
     raise ValueError("Scene template is missing the object material entry")
 
 
+def _find_named_asset(
+    asset_root: ET.Element, element_type: str, name: str
+) -> Optional[ET.Element]:
+    for element in asset_root.findall(element_type):
+        if element.get("name") == name:
+            return element
+    return None
+
+
 def load_ycb_object_spec(object_root: Union[str, Path]) -> YCBObjectSpec:
     """Load mesh and geometric bounds for a YCB object directory."""
     resolved_root = Path(object_root).resolve()
-    mesh_path = find_source_mesh(resolved_root)
+    mesh_path = _find_visual_mesh(resolved_root)
     pointcloud_path = find_source_ply(resolved_root)
     if mesh_path is None or pointcloud_path is None:
         raise FileNotFoundError(
             f"Could not find mesh and point cloud data under {resolved_root}"
         )
+    texture_path = _find_obj_texture(mesh_path.resolve())
 
     points = clean_points(load_ply_vertices(pointcloud_path))
     mins = points.min(axis=0)
@@ -112,6 +165,7 @@ def load_ycb_object_spec(object_root: Union[str, Path]) -> YCBObjectSpec:
         name=resolved_root.name,
         object_root=resolved_root,
         mesh_path=mesh_path.resolve(),
+        texture_path=texture_path,
         pointcloud_path=pointcloud_path.resolve(),
         mesh_offset=-center.astype(np.float32),
         half_extents=half_extents.astype(np.float32),
@@ -139,8 +193,10 @@ def create_single_object_ycb_scene(
 
     mesh_name = f"mesh_{object_spec.name}"
     material_name = f"material_{object_spec.name}"
+    texture_name = f"texture_{object_spec.name}"
     inertia = _stable_box_inertia(object_spec.half_extents, mass=0.15)
 
+    asset = _require_element(root, ".//asset")
     mesh = _require_element(root, ".//asset/mesh")
     material = _find_dynamic_material(root)
     target_body = _require_element(root, ".//worldbody/body[@name='target_object']")
@@ -161,7 +217,22 @@ def create_single_object_ycb_scene(
     mesh.set("file", object_spec.mesh_path.as_posix())
 
     material.set("name", material_name)
-    material.set("rgba", "0.82 0.28 0.24 1")
+    texture = _find_named_asset(asset, "texture", texture_name)
+    if object_spec.texture_path is not None:
+        if texture is None:
+            texture = ET.SubElement(asset, "texture")
+        texture.attrib.clear()
+        texture.set("name", texture_name)
+        texture.set("type", "2d")
+        texture.set("file", object_spec.texture_path.as_posix())
+
+        material.attrib.pop("rgba", None)
+        material.set("texture", texture_name)
+    else:
+        if texture is not None:
+            asset.remove(texture)
+        material.attrib.pop("texture", None)
+        material.set("rgba", "0.82 0.28 0.24 1")
 
     target_body.set("name", object_spec.body_name)
     target_body.set("pos", f"100 0 {float(object_spec.half_extents[2]):.6f}")

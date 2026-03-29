@@ -47,6 +47,7 @@ class FrankaGymEnvironment(gym.Env):
         ycb_object_root: str = DEFAULT_YCB_OBJECT_ROOT.as_posix(),
         target_body_name: str = "target_object",
         target_drop_height_range: Tuple[float, float] = (0.0, 0.03),
+        goal_height_range: Tuple[float, float] = (0.1, 0.3),
         visualize_pointclouds: bool = False,
         pointcloud_point_size: int = 1,
         pointcloud_alpha: float = 0.2,
@@ -84,7 +85,9 @@ class FrankaGymEnvironment(gym.Env):
         self.joint_dim = self.robot_dof
         self.target_body_name = target_body_name
         self.target_drop_height_range = target_drop_height_range
+        self.goal_height_range = goal_height_range
         self._rng = np.random.default_rng()
+        self.goal_position: np.ndarray = np.zeros(3, dtype=np.float32)
 
         self.ycb_object_root = Path(ycb_object_root).resolve()
         self.target_spec = load_ycb_object_spec(self.ycb_object_root)
@@ -120,8 +123,9 @@ class FrankaGymEnvironment(gym.Env):
         self.success_lift_height = 0.08
 
         self.env.add_collision_exception(self.target_body_name)
+        self._sample_goal_position()
 
-        # Observation space: Dict with point cloud + joint state
+        # Observation space: Dict with point cloud + joint state + ee_position + goal_position
         self.observation_space = spaces.Dict(
             {
                 "pointcloud": spaces.Box(
@@ -129,6 +133,12 @@ class FrankaGymEnvironment(gym.Env):
                 ),
                 "joint_state": spaces.Box(
                     low=-np.inf, high=np.inf, shape=(self.joint_dim,), dtype=np.float32
+                ),
+                "ee_position": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+                ),
+                "goal_position": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
                 ),
             }
         )
@@ -157,6 +167,8 @@ class FrankaGymEnvironment(gym.Env):
         if self.randomize_target_pose:
             self._reset_target_pose()
 
+        self._sample_goal_position()
+
         # Step a few times to settle simulation
         for _ in range(10):
             self.env.step()
@@ -178,6 +190,8 @@ class FrankaGymEnvironment(gym.Env):
         return {
             "pointcloud": np.zeros((self.num_points, 3), dtype=np.float32),
             "joint_state": np.zeros((self.joint_dim,), dtype=np.float32),
+            "ee_position": np.zeros((3,), dtype=np.float32),
+            "goal_position": np.zeros((3,), dtype=np.float32),
         }
 
     def _reset_target_pose(self) -> None:
@@ -217,6 +231,16 @@ class FrankaGymEnvironment(gym.Env):
         )
         self.env.reset_velocities()
         self.env.forward()
+
+    def _sample_goal_position(self) -> None:
+        """Randomly sample a goal XYZ the robot should bring the object to."""
+        bounds = self.workspace_bounds
+        x = float(self._rng.uniform(bounds["min_x"], bounds["max_x"]))
+        y = float(self._rng.uniform(bounds["min_y"], bounds["max_y"]))
+        z = self.table_height + float(
+            self._rng.uniform(self.goal_height_range[0], self.goal_height_range[1])
+        )
+        self.goal_position = np.array([x, y, z], dtype=np.float32)
 
     def get_target_position(self) -> np.ndarray:
         return self.env.get_object_position(self.target_body_name)
@@ -335,9 +359,13 @@ class FrankaGymEnvironment(gym.Env):
 
             self._last_pointcloud_empty = True
             joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
+            hand_id = self.env.model.body("hand").id
+            ee_position = self.env.data.xpos[hand_id].astype(np.float32)
             fallback_obs = {
                 "pointcloud": self._last_valid_observation["pointcloud"].copy(),
                 "joint_state": joint_state,
+                "ee_position": ee_position,
+                "goal_position": self.goal_position.copy(),
             }
             self._last_valid_observation = fallback_obs
             return fallback_obs
@@ -348,13 +376,21 @@ class FrankaGymEnvironment(gym.Env):
         # Extract joint state (positions only)
         joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
 
+        # Extract end-effector position and stable goal position
+        hand_id = self.env.model.body("hand").id
+        ee_position = self.env.data.xpos[hand_id].astype(np.float32)
+
         obs = {
             "pointcloud": pointcloud,
             "joint_state": joint_state,
+            "ee_position": ee_position,
+            "goal_position": self.goal_position.copy(),
         }
         self._last_valid_observation = {
             "pointcloud": pointcloud.copy(),
             "joint_state": joint_state.copy(),
+            "ee_position": ee_position.copy(),
+            "goal_position": self.goal_position.copy(),
         }
         return obs
 
