@@ -62,7 +62,7 @@ def add_batch_dimension(obs):
 
 _HERE = Path(__file__).parent
 _DEFAULT_POINTNET_CHECKPOINT = (
-    _HERE / ".." / "log" / "simsiam" / "ycb" / "ycb_medium" / "simsiam_pn_30.pth"
+    _HERE / ".." / "log" / "simsiam" / "ycb" / "ycb_medium_simsiam" / "simsiam_pn_30.pth"
 )
 _OUTPUT_DIR = _HERE / "training_runs"
 
