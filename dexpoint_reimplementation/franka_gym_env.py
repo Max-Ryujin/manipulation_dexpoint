@@ -359,8 +359,9 @@ class FrankaGymEnvironment(gym.Env):
 
             self._last_pointcloud_empty = True
             joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
-            hand_id = self.env.model.body("hand").id
-            ee_position = self.env.data.xpos[hand_id].astype(np.float32)
+            # get hand position as site position of attachment_site
+            attachment_site_id = self.env.model.site("attachment_site").id
+            ee_position = self.env.data.xpos[attachment_site_id].astype(np.float32)
             fallback_obs = {
                 "pointcloud": self._last_valid_observation["pointcloud"].copy(),
                 "joint_state": joint_state,
@@ -377,8 +378,8 @@ class FrankaGymEnvironment(gym.Env):
         joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
 
         # Extract end-effector position and stable goal position
-        hand_id = self.env.model.body("hand").id
-        ee_position = self.env.data.xpos[hand_id].astype(np.float32)
+        attachment_site_id = self.env.model.site("attachment_site").id
+        ee_position = self.env.data.xpos[attachment_site_id].astype(np.float32)
 
         obs = {
             "pointcloud": pointcloud,
