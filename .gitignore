@@ -68,5 +68,6 @@ notes.md
 dexart_baselines/*
 output/
 slurm
+slurm_cpu
 data/
 log/
