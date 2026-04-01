@@ -110,10 +110,11 @@ def infer_pointnet_variant(checkpoint_path: Optional[str]) -> str:
 
 def get_default_pointnet_checkpoint() -> Optional[str]:
     """Return the default checkpoint path that matches the RL medium encoder."""
-    if _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.exists():
-        return _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.as_posix()
+
     if _DEFAULT_RECONSTRUCTION_POINTNET_CHECKPOINT.exists():
         return _DEFAULT_RECONSTRUCTION_POINTNET_CHECKPOINT.as_posix()
+    if _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.exists():
+        return _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.as_posix()
     return None
 
 
