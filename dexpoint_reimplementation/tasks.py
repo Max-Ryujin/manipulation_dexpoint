@@ -12,17 +12,19 @@ class GraspingTask:
     REACH_REWARD_SCALE = 1.0
     GOAL_REWARD_SCALE = 0.5
     GOAL_REWARD_ACTIVATION_DISTANCE = 0.05
-    SUCCESS_DISTANCE_THRESHOLD = 0.04
+    SUCCESS_DISTANCE_THRESHOLD = 0.03
     SUCCESS_BONUS = 5.0
     TIME_PENALTY = 1e-3
     REACH_DISTANCE_OFFSET = 0.7
     GOAL_DISTANCE_OFFSET = 0.5
+    FINGER_HEIGHT_ALIGNMENT_SCALE = 0.02
+    FINGER_HEIGHT_ALIGNMENT_TOLERANCE = 0.02
 
     @staticmethod
     def get_default_config() -> Dict[str, Any]:
         """Get default task configuration."""
         return {
-            "max_episode_steps": 1000,
+            "max_episode_steps": 800,
             "randomize_target_pose": True,
             "reward_fn": GraspingTask.reward_function,
             "task_name": GraspingTask.NAME,
@@ -61,12 +63,14 @@ class GraspingTask:
         info = {"task": GraspingTask.NAME, "step": env.step_count}
 
         ee_pos = env.get_end_effector_position()
+        left_finger_pos, right_finger_pos = env.get_finger_positions()
         target_pos = env.get_target_position()
         goal_pos = env.goal_position
 
         reach_distance = float(np.linalg.norm(ee_pos - target_pos))
         ee_target_xy_distance = float(np.linalg.norm(ee_pos[:2] - target_pos[:2]))
         ee_target_z_distance = float(abs(ee_pos[2] - target_pos[2]))
+        finger_height_difference = float(abs(left_finger_pos[2] - right_finger_pos[2]))
         goal_distance = float(np.linalg.norm(target_pos - goal_pos))
         goal_xy_distance = float(np.linalg.norm(target_pos[:2] - goal_pos[:2]))
         goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
@@ -74,9 +78,7 @@ class GraspingTask:
         target_lift = float(target_pos[2] - env.target_rest_height)
 
         reach_reward_scale = float(
-            env.task_config.get(
-                "reach_reward_scale", GraspingTask.REACH_REWARD_SCALE
-            )
+            env.task_config.get("reach_reward_scale", GraspingTask.REACH_REWARD_SCALE)
         )
         goal_reward_scale = float(
             env.task_config.get("goal_reward_scale", GraspingTask.GOAL_REWARD_SCALE)
@@ -109,9 +111,28 @@ class GraspingTask:
                 "goal_distance_offset", GraspingTask.GOAL_DISTANCE_OFFSET
             )
         )
+        finger_height_alignment_scale = float(
+            env.task_config.get(
+                "finger_height_alignment_scale",
+                GraspingTask.FINGER_HEIGHT_ALIGNMENT_SCALE,
+            )
+        )
+        finger_height_alignment_tolerance = float(
+            env.task_config.get(
+                "finger_height_alignment_tolerance",
+                GraspingTask.FINGER_HEIGHT_ALIGNMENT_TOLERANCE,
+            )
+        )
 
         reach_reward = reach_reward_scale * (reach_distance_offset - reach_distance)
         reward += reach_reward
+
+        finger_height_alignment_reward = finger_height_alignment_scale * max(
+            0.0,
+            1.0
+            - (finger_height_difference / max(finger_height_alignment_tolerance, 1e-6)),
+        )
+        reward += finger_height_alignment_reward
 
         goal_reward = 0.0
         goal_reward_active = reach_distance <= goal_reward_activation_distance
@@ -133,12 +154,14 @@ class GraspingTask:
                 "reach_distance": reach_distance,
                 "ee_target_xy_distance": ee_target_xy_distance,
                 "ee_target_z_distance": ee_target_z_distance,
+                "finger_height_difference": finger_height_difference,
                 "goal_distance": goal_distance,
                 "goal_xy_distance": goal_xy_distance,
                 "goal_z_distance": goal_z_distance,
                 "target_height_above_table": target_height_above_table,
                 "target_lift": target_lift,
                 "reach_reward": reach_reward,
+                "finger_height_alignment_reward": finger_height_alignment_reward,
                 "goal_reward": goal_reward,
                 "time_penalty": time_penalty,
                 "success_bonus": success_bonus,

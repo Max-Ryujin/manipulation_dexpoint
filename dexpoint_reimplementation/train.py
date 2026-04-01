@@ -167,7 +167,7 @@ def train_dexpoint(
     learning_rate: float = 3e-4,
     batch_size: int = 64,
     n_epochs: int = 10,
-    n_steps: int = 2048,
+    n_steps: int = 1600,
     save_interval: int = 20000,
     verbose: int = 1,
     use_wandb: bool = False,

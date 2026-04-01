@@ -62,6 +62,7 @@ class YCBObjectSpec:
     mesh_offset: np.ndarray
     half_extents: np.ndarray
     placement_radius: float
+    scale: float = 1.0
     body_name: str = "target_object"
 
 
@@ -142,9 +143,15 @@ def _find_named_asset(
     return None
 
 
-def load_ycb_object_spec(object_root: Union[str, Path]) -> YCBObjectSpec:
+def load_ycb_object_spec(
+    object_root: Union[str, Path], scale: float = 1.0
+) -> YCBObjectSpec:
     """Load mesh and geometric bounds for a YCB object directory."""
     resolved_root = Path(object_root).resolve()
+    scale = float(scale)
+    if scale <= 0:
+        raise ValueError(f"Object scale must be positive, got {scale}")
+
     mesh_path = _find_visual_mesh(resolved_root)
     pointcloud_path = find_source_ply(resolved_root)
     if mesh_path is None or pointcloud_path is None:
@@ -161,15 +168,17 @@ def load_ycb_object_spec(object_root: Union[str, Path]) -> YCBObjectSpec:
         raise ValueError(f"Degenerate YCB object bounds for {resolved_root}")
 
     center = 0.5 * (mins + maxs)
+    scaled_half_extents = (scale * half_extents).astype(np.float32)
     return YCBObjectSpec(
         name=resolved_root.name,
         object_root=resolved_root,
         mesh_path=mesh_path.resolve(),
         texture_path=texture_path,
         pointcloud_path=pointcloud_path.resolve(),
-        mesh_offset=-center.astype(np.float32),
-        half_extents=half_extents.astype(np.float32),
-        placement_radius=float(np.linalg.norm(half_extents[:2])),
+        mesh_offset=(-scale * center).astype(np.float32),
+        half_extents=scaled_half_extents,
+        placement_radius=float(np.linalg.norm(scaled_half_extents[:2])),
+        scale=scale,
     )
 
 
@@ -215,6 +224,10 @@ def create_single_object_ycb_scene(
 
     mesh.set("name", mesh_name)
     mesh.set("file", object_spec.mesh_path.as_posix())
+    mesh.set(
+        "scale",
+        _format_vector(np.full(3, object_spec.scale, dtype=np.float32)),
+    )
 
     material.set("name", material_name)
     texture = _find_named_asset(asset, "texture", texture_name)
@@ -270,8 +283,9 @@ def create_single_object_ycb_scene(
 def ensure_single_object_ycb_scene(
     object_root: Union[str, Path] = DEFAULT_YCB_OBJECT_ROOT,
     scene_path: Optional[Union[str, Path]] = None,
+    scale: float = 1.0,
 ) -> tuple[Path, YCBObjectSpec]:
     """Create or refresh the single-object scene for the requested YCB object."""
-    object_spec = load_ycb_object_spec(object_root)
+    object_spec = load_ycb_object_spec(object_root, scale=scale)
     xml_path = create_single_object_ycb_scene(object_spec, scene_path=scene_path)
     return xml_path, object_spec

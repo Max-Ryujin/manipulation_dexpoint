@@ -17,7 +17,7 @@
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
-    <mesh name="mesh_005_tomato_soup_can" file="/work/rleap1/maximilian.kannen/manipulation/dexart_baselines/pretrain/data/ycb_raw/005_tomato_soup_can/poisson/textured.obj" />
+    <mesh name="mesh_005_tomato_soup_can" file="/work/rleap1/maximilian.kannen/manipulation/dexart_baselines/pretrain/data/ycb_raw/005_tomato_soup_can/poisson/textured.obj" scale="0.900000 0.900000 0.900000" />
     <material name="material_005_tomato_soup_can" texture="texture_005_tomato_soup_can" />
     <texture name="texture_005_tomato_soup_can" type="2d" file="/work/rleap1/maximilian.kannen/manipulation/dexart_baselines/pretrain/data/ycb_raw/005_tomato_soup_can/poisson/textured.png" />
   </asset>
@@ -37,11 +37,11 @@
       <site name="site_right" pos="-0.20 0 0.25" size="0.005" rgba="1 0 0 1" type="sphere" euler="-1.57 1.57 0" />
       <site name="site_left" pos=" 0.20 0 0.25" size="0.005" rgba="0 1 0 1" type="sphere" euler="-1.57 -1.57 0" />
     </body>
-    <body name="target_object" pos="100 0 0.048428">
+    <body name="target_object" pos="100 0 0.043585">
       <joint name="target_object_freejoint" type="free" />
-      <inertial mass="0.150000" pos="0 0 0" diaginertia="0.00019325 0.00019307 0.00015179" />
-      <geom name="target_object_visual" type="mesh" mesh="mesh_005_tomato_soup_can" pos="-0.003901 -0.006376 -0.053430" material="material_005_tomato_soup_can" contype="0" conaffinity="0" />
-      <geom name="target_object_collision" type="box" size="0.038938 0.038984 0.048428" pos="0 0 0" rgba="0 0 0 0" contype="2" conaffinity="1" condim="3" solimp="0.99 0.995 0.01" solref="0.01 1" friction="1 0.005 0.0001" />
+      <inertial mass="0.150000" pos="0 0 0" diaginertia="0.00015653 0.00015639 0.00012295" />
+      <geom name="target_object_visual" type="mesh" mesh="mesh_005_tomato_soup_can" pos="-0.003511 -0.005739 -0.048087" material="material_005_tomato_soup_can" contype="0" conaffinity="0" />
+      <geom name="target_object_collision" type="box" size="0.035044 0.035085 0.043585" pos="0 0 0" rgba="0 0 0 0" contype="2" conaffinity="1" condim="3" solimp="0.99 0.995 0.01" solref="0.01 1" friction="1 0.005 0.0001" />
     </body>
   </worldbody>
 </mujoco>

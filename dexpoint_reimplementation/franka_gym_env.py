@@ -45,6 +45,7 @@ class FrankaGymEnvironment(gym.Env):
         frame_skip: int = 10,
         randomize_target_pose: bool = True,
         ycb_object_root: str = DEFAULT_YCB_OBJECT_ROOT.as_posix(),
+        target_scale: float = 0.9,
         target_body_name: str = "target_object",
         target_drop_height_range: Tuple[float, float] = (0.0, 0.03),
         goal_height_range: Tuple[float, float] = (0.1, 0.3),
@@ -65,6 +66,7 @@ class FrankaGymEnvironment(gym.Env):
             rate: Simulation frequency (Hz)
             randomize_target_pose: Whether to randomize can placement each episode
             ycb_object_root: Path to the YCB object directory to load into the scene
+            target_scale: Uniform scale applied to the target object's visual and collision geometry
             target_body_name: Body name used for the grasp target inside MuJoCo
             target_drop_height_range: Extra randomized drop height range above table
             visualize_pointclouds: Whether to visualize point clouds in render output
@@ -83,6 +85,7 @@ class FrankaGymEnvironment(gym.Env):
         self.pointcloud_alpha = pointcloud_alpha
         self.robot_dof = 8
         self.joint_dim = self.robot_dof
+        self.target_scale = float(target_scale)
         self.target_body_name = target_body_name
         self.target_drop_height_range = target_drop_height_range
         self.goal_height_range = goal_height_range
@@ -90,10 +93,15 @@ class FrankaGymEnvironment(gym.Env):
         self.goal_position: np.ndarray = np.zeros(3, dtype=np.float32)
 
         self.ycb_object_root = Path(ycb_object_root).resolve()
-        self.target_spec = load_ycb_object_spec(self.ycb_object_root)
+        self.target_spec = load_ycb_object_spec(
+            self.ycb_object_root, scale=self.target_scale
+        )
 
         if xml_path is None:
-            scene_xml_path, _ = ensure_single_object_ycb_scene(self.ycb_object_root)
+            scene_xml_path, _ = ensure_single_object_ycb_scene(
+                self.ycb_object_root,
+                scale=self.target_scale,
+            )
             self.xml_path = scene_xml_path.as_posix()
         else:
             self.xml_path = xml_path
@@ -151,7 +159,7 @@ class FrankaGymEnvironment(gym.Env):
 
         # Task-specific attributes
         self.task_config = {}
-        self.max_episode_steps = 1000
+        self.max_episode_steps = 800
         self.step_count = 0
 
         # Frame buffering for edge case debugging
@@ -257,6 +265,13 @@ class FrankaGymEnvironment(gym.Env):
 
     def get_target_pose(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.env.get_object_pose(self.target_body_name)
+
+    def get_finger_positions(self) -> Tuple[np.ndarray, np.ndarray]:
+        left_finger_pos = self.env.get_object_position("left_finger").astype(np.float32)
+        right_finger_pos = self.env.get_object_position("right_finger").astype(
+            np.float32
+        )
+        return left_finger_pos, right_finger_pos
 
     def get_end_effector_position(self) -> np.ndarray:
         return self.env.data.site_xpos[self.attachment_site_id].astype(np.float32)
