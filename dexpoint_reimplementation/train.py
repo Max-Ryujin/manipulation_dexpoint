@@ -62,7 +62,13 @@ def add_batch_dimension(obs):
 
 _HERE = Path(__file__).parent
 _DEFAULT_POINTNET_CHECKPOINT = (
-    _HERE / ".." / "log" / "simsiam" / "ycb" / "ycb_medium_simsiam" / "simsiam_pn_30.pth"
+    _HERE
+    / ".."
+    / "log"
+    / "reconstruction"
+    / "ycb"
+    / "ycb_medium_reconstruction"
+    / "complete_pn_50.pth"
 )
 _OUTPUT_DIR = _HERE / "training_runs"
 
@@ -77,6 +83,36 @@ def create_output_dir():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     return run_dir
+
+
+def create_configured_environment(
+    task_name: str,
+    *,
+    visualize_pointclouds: bool,
+    pointcloud_point_size: int = 1,
+    pointcloud_alpha: float = 0.7,
+) -> FrankaGymEnvironment:
+    """Build and configure a FrankaGymEnvironment for training or evaluation."""
+    env = FrankaGymEnvironment(
+        xml_path=None,
+        task_name=task_name,
+        ycb_object_root=DEFAULT_YCB_OBJECT_ROOT.as_posix(),
+        num_points=512,
+        camera_height=480,
+        camera_width=640,
+        rate=200.0,
+        frame_skip=10,
+        visualize_pointclouds=visualize_pointclouds,
+        pointcloud_point_size=pointcloud_point_size,
+        pointcloud_alpha=pointcloud_alpha,
+    )
+    task_config = create_task_config(
+        task_name,
+        max_episode_steps=1000,
+        target_body_name=env.target_body_name,
+    )
+    env.configure_task(task_config)
+    return env
 
 
 def train_dexpoint(
@@ -151,27 +187,18 @@ def train_dexpoint(
 
     # Create environment
     print(f"\n Creating environment...")
-    env = FrankaGymEnvironment(
-        xml_path=None,
-        task_name=task_name,
-        ycb_object_root=DEFAULT_YCB_OBJECT_ROOT.as_posix(),
-        num_points=512,
-        camera_height=480,
-        camera_width=640,
-        rate=200.0,
-        frame_skip=10,
-        visualize_pointclouds=record_video,  # Enable point cloud visualization in videos
-        pointcloud_point_size=1,
-        pointcloud_alpha=0.7,
-    )
-
-    # Configure task
-    task_config = create_task_config(
+    env = create_configured_environment(
         task_name,
-        max_episode_steps=1000,
-        target_body_name=env.target_body_name,
+        visualize_pointclouds=False,
     )
-    env.configure_task(task_config)
+    eval_env = (
+        create_configured_environment(
+            task_name,
+            visualize_pointclouds=True,
+        )
+        if record_video
+        else None
+    )
     print(f"✓ Environment ready")
     print(f"  - Task: {task_name}")
     print(f"  - Agent: {agent_name.upper()}")
@@ -201,7 +228,7 @@ def train_dexpoint(
             use_sde=False,
             sde_sample_freq=-1,
             target_kl=None,
-            create_eval_env=True,
+            create_eval_env=False,
             policy_kwargs={
                 # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
@@ -225,7 +252,7 @@ def train_dexpoint(
             max_grad_norm=0.5,
             use_sde=False,
             sde_sample_freq=-1,
-            create_eval_env=True,
+            create_eval_env=False,
             policy_kwargs={
                 # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
@@ -240,6 +267,8 @@ def train_dexpoint(
     if agent is None:
         print(f"Unsupported agent: {agent_name}")
         env.close()
+        if eval_env is not None:
+            eval_env.close()
         return
 
     # Training configuration
@@ -288,7 +317,6 @@ def train_dexpoint(
         steps_so_far = 0
         step_count = 0
         video_frames = []
-        video_writer = None
         training_callback = TaskInfoLoggingCallback(use_wandb=use_wandb)
 
         while steps_so_far < total_timesteps:
@@ -309,16 +337,16 @@ def train_dexpoint(
             step_count += 1
 
             # Record video if needed
-            if record_video and (steps_so_far % video_interval == 0):
+            if eval_env is not None and (steps_so_far % video_interval == 0):
                 print(f"    Recording validation video...")
                 video_frames = []
-                obs = env.reset()
+                obs = eval_env.reset()
                 episode_reward = 0.0
                 episode_steps = 0
                 max_episode_steps_video = 1000
 
                 while episode_steps < max_episode_steps_video:
-                    frame = env.render_with_pointcloud(mode="rgb_array")
+                    frame = eval_env.render_with_pointcloud(mode="rgb_array")
                     if frame is not None:
                         video_frames.append(frame)
 
@@ -328,7 +356,7 @@ def train_dexpoint(
                     if isinstance(action, np.ndarray) and action.ndim > 1:
                         action = action[0]
 
-                    obs, reward, done, info = env.step(action)
+                    obs, reward, done, info = eval_env.step(action)
                     episode_reward += reward
                     episode_steps += 1
 
@@ -406,6 +434,8 @@ def train_dexpoint(
 
     finally:
         env.close()
+        if eval_env is not None:
+            eval_env.close()
         print(f"\nEnvironment closed.")
 
 

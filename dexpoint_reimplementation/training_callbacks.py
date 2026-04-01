@@ -1,6 +1,6 @@
 """Training callbacks for richer task and reward logging."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from numbers import Number
 from typing import TYPE_CHECKING
 
@@ -21,6 +21,8 @@ class TaskInfoLoggingCallback(BaseCallback):
         self.use_wandb = use_wandb
         self.rollout_metrics = defaultdict(list)
         self.episode_metrics = defaultdict(list)
+        self.episode_reason_counts = Counter()
+        self.completed_episodes = 0
 
     @staticmethod
     def _is_scalar(value) -> bool:
@@ -29,6 +31,8 @@ class TaskInfoLoggingCallback(BaseCallback):
     def _on_rollout_start(self) -> None:
         self.rollout_metrics.clear()
         self.episode_metrics.clear()
+        self.episode_reason_counts.clear()
+        self.completed_episodes = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -48,6 +52,17 @@ class TaskInfoLoggingCallback(BaseCallback):
                     if index < len(dones) and bool(dones[index]):
                         self.episode_metrics[f"episode/{key}"].append(float(value))
 
+            if index < len(dones) and bool(dones[index]):
+                self.completed_episodes += 1
+                if bool(info.get("is_success", False)):
+                    self.episode_reason_counts["success"] += 1
+                elif info.get("pointcloud_empty", False):
+                    self.episode_reason_counts["empty_pointcloud"] += 1
+                elif bool(info.get("step_limit_reached", False)):
+                    self.episode_reason_counts["step_limit"] += 1
+                else:
+                    self.episode_reason_counts["other"] += 1
+
         return True
 
     def _on_rollout_end(self) -> None:
@@ -60,6 +75,15 @@ class TaskInfoLoggingCallback(BaseCallback):
         for metric_name, values in self.episode_metrics.items():
             if values:
                 aggregated_metrics[metric_name] = float(np.mean(values))
+
+        if self.completed_episodes > 0:
+            for reason, count in self.episode_reason_counts.items():
+                aggregated_metrics[
+                    f"rollout/episode_end/{reason}_rate"
+                ] = float(count / self.completed_episodes)
+                aggregated_metrics[
+                    f"rollout/episode_end/{reason}_count"
+                ] = float(count)
 
         for metric_name, value in aggregated_metrics.items():
             self.logger.record(metric_name, value)

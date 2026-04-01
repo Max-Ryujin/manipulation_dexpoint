@@ -109,6 +109,8 @@ class FrankaGymEnvironment(gym.Env):
             self.xml_path, rate=rate, frame_skip=self.frame_skip
         )
         self.camera = MujocoCamera(self.env, width=camera_width, height=camera_height)
+        self.hand_body_id = self.env.model.body("hand").id
+        self.attachment_site_id = self.env.model.site("attachment_site").id
 
         self.ctrl_min = self.env.model.actuator_ctrlrange[: self.robot_dof, 0]
         self.ctrl_max = self.env.model.actuator_ctrlrange[: self.robot_dof, 1]
@@ -157,6 +159,7 @@ class FrankaGymEnvironment(gym.Env):
         self.episode_frames = []
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
+        self._last_pointcloud_size = 0
 
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
@@ -181,10 +184,17 @@ class FrankaGymEnvironment(gym.Env):
         # Clear frame buffer for new episode
         self.frame_buffer.clear()
         self.episode_frames = []
+        self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
+        self._last_pointcloud_size = 0
 
         obs = self._get_observation()
         return obs
+
+    def seed(self, seed: Optional[int] = None) -> List[Optional[int]]:
+        """Seed the environment RNG used for object and goal sampling."""
+        self._rng = np.random.default_rng(seed)
+        return [seed]
 
     def _create_empty_observation(self) -> Dict[str, np.ndarray]:
         return {
@@ -248,6 +258,9 @@ class FrankaGymEnvironment(gym.Env):
     def get_target_pose(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.env.get_object_pose(self.target_body_name)
 
+    def get_end_effector_position(self) -> np.ndarray:
+        return self.env.data.site_xpos[self.attachment_site_id].astype(np.float32)
+
     def step(
         self, action: np.ndarray
     ) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
@@ -264,6 +277,12 @@ class FrankaGymEnvironment(gym.Env):
             info: Info dict with task-specific metrics
         """
 
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape != (self.robot_dof,):
+            raise ValueError(
+                f"Expected action shape {(self.robot_dof,)}, got {action.shape}"
+            )
+
         arm_action = action[:7]
         gripper_action = action[7]
 
@@ -276,9 +295,18 @@ class FrankaGymEnvironment(gym.Env):
         target_gripper_ctrl = ((gripper_action + 1.0) / 2.0) * (
             self.ctrl_max[7] - self.ctrl_min[7]
         ) + self.ctrl_min[7]
-        target_ctrl = np.append(target_arm_qpos, target_gripper_ctrl)
-
-        target_ctrl = np.clip(target_ctrl, self.ctrl_min, self.ctrl_max)
+        unclipped_target_ctrl = np.append(target_arm_qpos, target_gripper_ctrl)
+        target_ctrl = np.clip(unclipped_target_ctrl, self.ctrl_min, self.ctrl_max)
+        action_metrics = {
+            "action_l2": float(np.linalg.norm(action)),
+            "arm_action_l2": float(np.linalg.norm(arm_action)),
+            "gripper_action": float(gripper_action),
+            "action_saturation_fraction": float(np.mean(np.abs(action) >= 0.95)),
+            "ctrl_clip_fraction": float(
+                np.mean(~np.isclose(target_ctrl, unclipped_target_ctrl, atol=1e-6))
+            ),
+            "gripper_ctrl_command": float(target_ctrl[7]),
+        }
         self.env.data.ctrl[:8] = target_ctrl
 
         # Step simulation
@@ -296,8 +324,14 @@ class FrankaGymEnvironment(gym.Env):
         if self._last_pointcloud_empty:
             info = {
                 "pointcloud_empty": True,
+                "pointcloud_size": self._last_pointcloud_size,
+                "contact_count": int(self.env.data.ncon),
+                "max_joint_speed": float(
+                    np.max(np.abs(self.env.data.qvel[: self.robot_dof]))
+                ),
                 "episode_failure_reason": "empty_pointcloud",
             }
+            info.update(action_metrics)
             done = True
             reward = 0.0
             self.episode_frames = []
@@ -305,6 +339,13 @@ class FrankaGymEnvironment(gym.Env):
 
         # Compute task-specific reward and done signal
         reward, done, info = self._compute_reward_and_done()
+        info.setdefault("pointcloud_empty", False)
+        info["pointcloud_size"] = self._last_pointcloud_size
+        info["contact_count"] = int(self.env.data.ncon)
+        info["max_joint_speed"] = float(
+            np.max(np.abs(self.env.data.qvel[: self.robot_dof]))
+        )
+        info.update(action_metrics)
 
         # Episode termination on max steps
         if self.step_count >= self.max_episode_steps:
@@ -329,10 +370,10 @@ class FrankaGymEnvironment(gym.Env):
             workspace_bounds=self.workspace_bounds,
             table_height=self.table_height,
         )
+        self._last_pointcloud_size = int(len(merged_points))
 
         if len(merged_points) == 0:
-            hand_id = self.env.model.body("hand").id
-            hand_pos = self.env.data.xpos[hand_id].copy()
+            hand_pos = self.env.data.xpos[self.hand_body_id].copy()
             max_joint_speed = float(
                 np.max(np.abs(self.env.data.qvel[: self.robot_dof]))
             )
@@ -359,9 +400,7 @@ class FrankaGymEnvironment(gym.Env):
 
             self._last_pointcloud_empty = True
             joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
-            # get hand position as site position of attachment_site
-            attachment_site_id = self.env.model.site("attachment_site").id
-            ee_position = self.env.data.xpos[attachment_site_id].astype(np.float32)
+            ee_position = self.get_end_effector_position()
             fallback_obs = {
                 "pointcloud": self._last_valid_observation["pointcloud"].copy(),
                 "joint_state": joint_state,
@@ -378,8 +417,7 @@ class FrankaGymEnvironment(gym.Env):
         joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
 
         # Extract end-effector position and stable goal position
-        attachment_site_id = self.env.model.site("attachment_site").id
-        ee_position = self.env.data.xpos[attachment_site_id].astype(np.float32)
+        ee_position = self.get_end_effector_position()
 
         obs = {
             "pointcloud": pointcloud,

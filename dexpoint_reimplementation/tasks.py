@@ -60,12 +60,18 @@ class GraspingTask:
         done = False
         info = {"task": GraspingTask.NAME, "step": env.step_count}
 
-        ee_pos = env.env.data.xpos[env.env.model.site("attachment_site").id]
+        ee_pos = env.get_end_effector_position()
         target_pos = env.get_target_position()
         goal_pos = env.goal_position
 
         reach_distance = float(np.linalg.norm(ee_pos - target_pos))
+        ee_target_xy_distance = float(np.linalg.norm(ee_pos[:2] - target_pos[:2]))
+        ee_target_z_distance = float(abs(ee_pos[2] - target_pos[2]))
         goal_distance = float(np.linalg.norm(target_pos - goal_pos))
+        goal_xy_distance = float(np.linalg.norm(target_pos[:2] - goal_pos[:2]))
+        goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
+        target_height_above_table = float(target_pos[2] - env.table_height)
+        target_lift = float(target_pos[2] - env.target_rest_height)
 
         reach_reward_scale = float(
             env.task_config.get(
@@ -125,7 +131,13 @@ class GraspingTask:
         info.update(
             {
                 "reach_distance": reach_distance,
+                "ee_target_xy_distance": ee_target_xy_distance,
+                "ee_target_z_distance": ee_target_z_distance,
                 "goal_distance": goal_distance,
+                "goal_xy_distance": goal_xy_distance,
+                "goal_z_distance": goal_z_distance,
+                "target_height_above_table": target_height_above_table,
+                "target_lift": target_lift,
                 "reach_reward": reach_reward,
                 "goal_reward": goal_reward,
                 "time_penalty": time_penalty,

@@ -57,8 +57,21 @@ class FrankaEnvironment(BaseEnvironment):
         self.collision_exceptions = []
 
         # Set initial position
-        self.data.qpos[:8] = np.array([0.5, 0, 0, -1.57079, 0, 1.57079, -0.7853, 0.04])
-        self.data.ctrl[:8] = np.array([0.5, 0, 0, -1.57079, 0, 1.57079, -0.7853, 255])
+        initial_qpos = np.array(
+            [0.5, 0, 0, -1.57079, 0, 1.57079, -0.7853, 0.04], dtype=np.float64
+        )
+        initial_ctrl = initial_qpos.copy()
+        gripper_ctrl_min, gripper_ctrl_max = self.model.actuator_ctrlrange[7]
+        if gripper_ctrl_max > 1.0:
+            initial_ctrl[7] = float(gripper_ctrl_max)
+        else:
+            initial_ctrl[7] = float(
+                np.clip(initial_qpos[7], gripper_ctrl_min, gripper_ctrl_max)
+            )
+
+        self.data.qpos[:8] = initial_qpos
+        self.data.ctrl[:8] = initial_ctrl
+        mujoco.mj_forward(self.model, self.data)
         self.ik.update_configuration(self.data.qpos)
         self.initial_ctrl = self.data.ctrl.copy()
         self.initial_qpos = self.data.qpos.copy()
@@ -93,6 +106,7 @@ class FrankaEnvironment(BaseEnvironment):
         self.data.qpos[:] = self.initial_qpos
         self.data.qvel[:] = self.initial_qvel
         self.ik.update_configuration(self.data.qpos)
+        mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
 
     def step(self):
