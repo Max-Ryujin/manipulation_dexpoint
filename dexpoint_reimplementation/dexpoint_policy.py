@@ -63,11 +63,20 @@ class PointNetExtractor(nn.Module):
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         checkpoint = th.load(checkpoint_path, map_location="cpu")
-        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        state_dict = (
+            checkpoint.get("state_dict", checkpoint)
+            if isinstance(checkpoint, dict)
+            else checkpoint
+        )
         expected_keys = set(self.pointnet.state_dict().keys())
 
         candidate_state_dicts = [state_dict]
-        for prefix in ("module.", "encoder.", "pointnet.", "pointnet_extractor.pointnet."):
+        for prefix in (
+            "module.",
+            "encoder.",
+            "pointnet.",
+            "pointnet_extractor.pointnet.",
+        ):
             stripped = {}
             changed = False
             for key, value in state_dict.items():
@@ -86,8 +95,18 @@ class PointNetExtractor(nn.Module):
                 print(f"Loaded pretrained PointNet weights from {checkpoint_path}")
                 return
 
+        matched_variant = None
+        if {"local_mlp.0.weight", "local_mlp.2.weight"}.issubset(state_dict.keys()):
+            if "local_mlp.10.weight" in state_dict:
+                matched_variant = "large"
+            elif "local_mlp.6.weight" in state_dict:
+                matched_variant = "medium"
+            else:
+                matched_variant = "small"
+
         raise RuntimeError(
-            f"Checkpoint at {checkpoint_path} does not match PointNet {type(self.pointnet).__name__}"
+            f"Checkpoint at {checkpoint_path} does not match PointNet {type(self.pointnet).__name__}. "
+            f"Detected checkpoint variant: {matched_variant or 'unknown'}."
         )
 
     def forward(self, pointcloud: th.Tensor) -> th.Tensor:

@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 import sys
 from typing import TYPE_CHECKING, Optional
+import torch
 import wandb
 
 # Add dexart to path
@@ -61,7 +62,16 @@ def add_batch_dimension(obs):
 
 
 _HERE = Path(__file__).parent
-_DEFAULT_POINTNET_CHECKPOINT = (
+_DEFAULT_SIMSIAM_POINTNET_CHECKPOINT = (
+    _HERE
+    / ".."
+    / "log"
+    / "simsiam"
+    / "ycb"
+    / "ycb_medium_simsiam"
+    / "simsiam_pn_30.pth"
+)
+_DEFAULT_RECONSTRUCTION_POINTNET_CHECKPOINT = (
     _HERE
     / ".."
     / "log"
@@ -71,6 +81,40 @@ _DEFAULT_POINTNET_CHECKPOINT = (
     / "complete_pn_50.pth"
 )
 _OUTPUT_DIR = _HERE / "training_runs"
+
+
+def infer_pointnet_variant(checkpoint_path: Optional[str]) -> str:
+    """Infer the PointNet architecture variant from checkpoint keys."""
+    if checkpoint_path is None:
+        return "medium"
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = (
+        checkpoint.get("state_dict", checkpoint)
+        if isinstance(checkpoint, dict)
+        else checkpoint
+    )
+    keys = set(state_dict.keys())
+
+    if {"local_mlp.0.weight", "local_mlp.2.weight"}.issubset(keys):
+        if "local_mlp.10.weight" in keys:
+            return "large"
+        if "local_mlp.6.weight" in keys:
+            return "medium"
+        return "small"
+
+    raise RuntimeError(
+        f"Could not infer PointNet variant from checkpoint: {checkpoint_path}"
+    )
+
+
+def get_default_pointnet_checkpoint() -> Optional[str]:
+    """Return the default checkpoint path that matches the RL medium encoder."""
+    if _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.exists():
+        return _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.as_posix()
+    if _DEFAULT_RECONSTRUCTION_POINTNET_CHECKPOINT.exists():
+        return _DEFAULT_RECONSTRUCTION_POINTNET_CHECKPOINT.as_posix()
+    return None
 
 
 def create_output_dir():
@@ -129,6 +173,7 @@ def train_dexpoint(
     record_video: bool = True,
     video_interval: int = 20000,
     pointnet_checkpoint_path: Optional[str] = None,
+    pointnet_variant: str = "auto",
     freeze_pointnet: bool = False,
     wandb_run_name: Optional[str] = None,
 ):
@@ -148,7 +193,8 @@ def train_dexpoint(
         use_wandb: Enable Weights & Biases logging
         record_video: Record training videos
         video_interval: Record video every N timesteps
-        pointnet_checkpoint_path: Optional SimSiam encoder checkpoint
+        pointnet_checkpoint_path: Optional PointNet encoder checkpoint
+        pointnet_variant: PointNet architecture variant or "auto" to infer it
         freeze_pointnet: Whether to keep PointNet frozen during RL training
         wandb_run_name: Optional explicit Weights & Biases run name
     """
@@ -158,6 +204,11 @@ def train_dexpoint(
 
     resolved_wandb_run_name = wandb_run_name or (
         f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    resolved_pointnet_variant = (
+        infer_pointnet_variant(pointnet_checkpoint_path)
+        if pointnet_variant == "auto"
+        else pointnet_variant
     )
 
     if use_wandb:
@@ -176,6 +227,7 @@ def train_dexpoint(
                 "video_interval": video_interval,
                 "pointcloud_points": 512,
                 "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "pointnet_variant": resolved_pointnet_variant,
                 "freeze_pointnet": freeze_pointnet,
                 "wandb_run_name": resolved_wandb_run_name,
             },
@@ -202,6 +254,7 @@ def train_dexpoint(
     print(f"✓ Environment ready")
     print(f"  - Task: {task_name}")
     print(f"  - Agent: {agent_name.upper()}")
+    print(f"  - PointNet variant: {resolved_pointnet_variant}")
     print(f"  - Observation space: {env.observation_space}")
     print(f"  - Action space: {env.action_space}")
 
@@ -232,7 +285,7 @@ def train_dexpoint(
             policy_kwargs={
                 # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                "pointnet_variant": "medium",
+                "pointnet_variant": resolved_pointnet_variant,
                 "pointnet_checkpoint_path": pointnet_checkpoint_path,
                 "freeze_pointnet": freeze_pointnet,
             },
@@ -256,7 +309,7 @@ def train_dexpoint(
             policy_kwargs={
                 # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
                 "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                "pointnet_variant": "medium",
+                "pointnet_variant": resolved_pointnet_variant,
                 "pointnet_checkpoint_path": pointnet_checkpoint_path,
                 "freeze_pointnet": freeze_pointnet,
             },
@@ -295,6 +348,7 @@ def train_dexpoint(
         "record_video": record_video,
         "video_interval": video_interval,
         "wandb_run_name": resolved_wandb_run_name if use_wandb else None,
+        "pointnet_variant": resolved_pointnet_variant,
         "env_config": {
             "num_points": 512,
             "camera_names": ["top_camera", "side_camera", "front_camera"],
@@ -496,12 +550,15 @@ def main():
     parser.add_argument(
         "--pointnet-checkpoint",
         type=str,
-        default=(
-            _DEFAULT_POINTNET_CHECKPOINT.as_posix()
-            if _DEFAULT_POINTNET_CHECKPOINT.exists()
-            else None
-        ),
+        default=get_default_pointnet_checkpoint(),
         help="Path to a pretrained PointNet encoder checkpoint.",
+    )
+    parser.add_argument(
+        "--pointnet-variant",
+        type=str,
+        default="auto",
+        choices=["auto", "small", "medium", "large"],
+        help="PointNet architecture to use. 'auto' infers the variant from the checkpoint.",
     )
     parser.add_argument(
         "--freeze-pointnet",
@@ -523,6 +580,7 @@ def main():
         record_video=args.record_video,
         video_interval=args.video_interval,
         pointnet_checkpoint_path=args.pointnet_checkpoint,
+        pointnet_variant=args.pointnet_variant,
         freeze_pointnet=args.freeze_pointnet,
         wandb_run_name=args.wandb_run_name,
     )
