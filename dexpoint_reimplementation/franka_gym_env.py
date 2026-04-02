@@ -125,6 +125,8 @@ class FrankaGymEnvironment(gym.Env):
 
         self.ctrl_min = self.env.model.actuator_ctrlrange[: self.robot_dof, 0]
         self.ctrl_max = self.env.model.actuator_ctrlrange[: self.robot_dof, 1]
+        self.gripper_ctrl_min = float(self.ctrl_min[7])
+        self.gripper_ctrl_max = float(self.ctrl_max[7])
 
         self.workspace_bounds, self.workspace_info = get_workspace_configuration(
             self.env.model
@@ -181,14 +183,13 @@ class FrankaGymEnvironment(gym.Env):
         if self.randomize_target_pose:
             self._reset_target_pose()
 
-        self._sample_goal_position()
-
         # Step a few times to settle simulation
         for _ in range(10):
             self.env.step()
 
         target_pos = self.get_target_position()
         self.target_rest_height = float(target_pos[2])
+        self._sample_goal_position(target_position=target_pos)
 
         self.step_count = 0
 
@@ -253,8 +254,21 @@ class FrankaGymEnvironment(gym.Env):
         self.env.reset_velocities()
         self.env.forward()
 
-    def _sample_goal_position(self) -> None:
-        """Randomly sample a goal XYZ the robot should bring the object to."""
+    def _sample_goal_position(
+        self, target_position: Optional[np.ndarray] = None
+    ) -> None:
+        """Sample a task goal position for the current episode."""
+        if self.task_name == "grasping" and target_position is not None:
+            self.goal_position = np.array(
+                [
+                    float(target_position[0]),
+                    float(target_position[1]),
+                    float(self.target_rest_height + self.success_lift_height),
+                ],
+                dtype=np.float32,
+            )
+            return
+
         bounds = self.workspace_bounds
         x = float(self._rng.uniform(bounds["min_x"], bounds["max_x"]))
         y = float(self._rng.uniform(bounds["min_y"], bounds["max_y"]))
@@ -282,6 +296,18 @@ class FrankaGymEnvironment(gym.Env):
 
     def get_gripper_actuator_force(self) -> float:
         return float(self.env.data.actuator_force[7])
+
+    def get_gripper_joint_position(self) -> float:
+        return float(self.env.data.qpos[7])
+
+    def get_gripper_open_fraction(self) -> float:
+        ctrl_span = self.gripper_ctrl_max - self.gripper_ctrl_min
+        if ctrl_span <= 1e-8:
+            return 0.0
+        joint_position = self.get_gripper_joint_position()
+        return float(
+            np.clip((joint_position - self.gripper_ctrl_min) / ctrl_span, 0.0, 1.0)
+        )
 
     def get_end_effector_position(self) -> np.ndarray:
         return self.env.data.site_xpos[self.attachment_site_id].astype(np.float32)
@@ -331,6 +357,8 @@ class FrankaGymEnvironment(gym.Env):
                 np.mean(~np.isclose(target_ctrl, unclipped_target_ctrl, atol=1e-6))
             ),
             "gripper_ctrl_command": float(target_ctrl[7]),
+            "gripper_joint_position": self.get_gripper_joint_position(),
+            "gripper_open_fraction": self.get_gripper_open_fraction(),
         }
         self.env.data.ctrl[:8] = target_ctrl
 
