@@ -7,7 +7,7 @@ from pathlib import Path
 import json
 from datetime import datetime
 import sys
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 import torch
 import wandb
 
@@ -35,6 +35,7 @@ else:
     from stable_baselines3.common.policies import (
         MultiInputActorCriticPolicy,
     )
+from dexart_baselines.stable_baselines3.common.vec_env import SubprocVecEnv
 from dexpoint_policy import DexPointPolicy
 
 # from dexart_baselines.stable_baselines3.common.policies import MlpPolicy
@@ -160,13 +161,38 @@ def create_configured_environment(
     return env
 
 
+def make_environment_factory(
+    task_name: str,
+    *,
+    visualize_pointclouds: bool,
+    pointcloud_point_size: int = 1,
+    pointcloud_alpha: float = 0.7,
+    seed: Optional[int] = None,
+) -> Callable[[], FrankaGymEnvironment]:
+    """Create a picklable environment factory for vectorized rollouts."""
+
+    def _make_env() -> FrankaGymEnvironment:
+        env = create_configured_environment(
+            task_name,
+            visualize_pointclouds=visualize_pointclouds,
+            pointcloud_point_size=pointcloud_point_size,
+            pointcloud_alpha=pointcloud_alpha,
+        )
+        if seed is not None:
+            env.seed(seed)
+        return env
+
+    return _make_env
+
+
 def train_dexpoint(
     task_name: str = "grasping",
     agent_name: str = "ppo",
+    num_envs: int = 1,
     total_timesteps: int = 100000,
     learning_rate: float = 3e-4,
     batch_size: int = 64,
-    n_epochs: int = 10,
+    n_epochs: int = 5,
     n_steps: int = 1600,
     save_interval: int = 20000,
     verbose: int = 1,
@@ -184,6 +210,7 @@ def train_dexpoint(
     Args:
         task_name: Task to train on
         agent_name: RL algorithm to train with
+        num_envs: Number of parallel training environments
         total_timesteps: Total training timesteps
         learning_rate: Learning rate for Adam optimizer
         batch_size: Batch size for PPO updates
@@ -211,6 +238,9 @@ def train_dexpoint(
         if pointnet_variant == "auto"
         else pointnet_variant
     )
+
+    if num_envs < 1:
+        raise ValueError(f"num_envs must be >= 1, got {num_envs}")
 
     if use_wandb:
         wandb.init(
@@ -240,10 +270,23 @@ def train_dexpoint(
 
     # Create environment
     print(f"\n Creating environment...")
-    env = create_configured_environment(
+    reference_env = create_configured_environment(
         task_name,
         visualize_pointclouds=False,
     )
+    env = reference_env
+    if num_envs > 1:
+        env.close()
+        env = SubprocVecEnv(
+            [
+                make_environment_factory(
+                    task_name,
+                    visualize_pointclouds=False,
+                    seed=env_index,
+                )
+                for env_index in range(num_envs)
+            ]
+        )
     eval_env = (
         create_configured_environment(
             task_name,
@@ -255,6 +298,7 @@ def train_dexpoint(
     print(f"✓ Environment ready")
     print(f"  - Task: {task_name}")
     print(f"  - Agent: {agent_name.upper()}")
+    print(f"  - Parallel envs: {num_envs}")
     print(f"  - PointNet variant: {resolved_pointnet_variant}")
     print(f"  - Observation space: {env.observation_space}")
     print(f"  - Action space: {env.action_space}")
@@ -328,6 +372,9 @@ def train_dexpoint(
     # Training configuration
     print(f"\n Training configuration:")
     print(f"  - Agent: {agent_name.upper()}")
+    print(f"  - Device: {agent.device}")
+    print(f"  - Parallel envs: {num_envs}")
+    print(f"  - Rollout size: {n_steps * num_envs}")
     print(f"  - Total timesteps: {total_timesteps}")
     print(f"  - Learning rate: {learning_rate}")
     print(f"  - Batch size: {batch_size}")
@@ -339,11 +386,13 @@ def train_dexpoint(
     config = {
         "task": task_name,
         "agent": agent_name,
+        "num_envs": num_envs,
         "total_timesteps": total_timesteps,
         "learning_rate": learning_rate,
         "batch_size": batch_size,
         "n_epochs": n_epochs,
         "n_steps": n_steps,
+        "rollout_size": n_steps * num_envs,
         "timestamp": datetime.now().isoformat(),
         "use_wandb": use_wandb,
         "record_video": record_video,
@@ -353,8 +402,8 @@ def train_dexpoint(
         "env_config": {
             "num_points": 512,
             "camera_names": ["top_camera", "side_camera", "front_camera"],
-            "target_body_name": env.target_body_name,
-            "ycb_object_root": env.ycb_object_root.as_posix(),
+            "target_body_name": reference_env.target_body_name,
+            "ycb_object_root": reference_env.ycb_object_root.as_posix(),
         },
         "pointnet_checkpoint_path": pointnet_checkpoint_path,
         "freeze_pointnet": freeze_pointnet,
@@ -371,15 +420,17 @@ def train_dexpoint(
         n_save_steps = save_interval
         steps_so_far = 0
         step_count = 0
+        next_video_step = video_interval
         video_frames = []
         training_callback = TaskInfoLoggingCallback(use_wandb=use_wandb)
 
         while steps_so_far < total_timesteps:
             remaining = total_timesteps - steps_so_far
             train_steps = min(n_save_steps, remaining)
+            batch_start = steps_so_far
 
             print(
-                f"\n  Training batch {step_count + 1}: {train_steps} steps ({steps_so_far}/{total_timesteps} total)"
+                f"\n  Training batch {step_count + 1}: target {train_steps} steps ({steps_so_far}/{total_timesteps} total)"
             )
 
             # Train for this batch
@@ -388,11 +439,13 @@ def train_dexpoint(
                 callback=training_callback,
                 reset_num_timesteps=(step_count == 0),
             )
-            steps_so_far += train_steps
+            steps_so_far = int(agent.num_timesteps)
             step_count += 1
+            actual_batch_steps = steps_so_far - batch_start
+            print(f"    Collected {actual_batch_steps} environment steps")
 
             # Record video if needed
-            if eval_env is not None and (steps_so_far % video_interval == 0):
+            if eval_env is not None and steps_so_far >= next_video_step:
                 print(f"    Recording validation video...")
                 video_frames = []
                 obs = eval_env.reset()
@@ -415,7 +468,15 @@ def train_dexpoint(
                     episode_reward += reward
                     episode_steps += 1
 
+                    success = info.get("is_success", False)
+
                     if done:
+                        # check for success
+                        if success:
+                            print(
+                                f"    Episode success! Reward: {episode_reward:.2f}, Steps: {episode_steps}"
+                            )
+
                         break
 
                 # Save video
@@ -431,6 +492,7 @@ def train_dexpoint(
                                 "validation/video": wandb.Video(
                                     str(video_path), fps=30, format="mp4"
                                 ),
+                                "validation/episode_success": success,
                             }
                         )
                 elif use_wandb and wandb.run is not None:
@@ -440,6 +502,8 @@ def train_dexpoint(
                             "validation/episode_steps": episode_steps,
                         }
                     )
+                while next_video_step <= steps_so_far:
+                    next_video_step += video_interval
 
             # Save checkpoint
             checkpoint_path = run_dir / f"model_checkpoint_{steps_so_far}.zip"
@@ -512,6 +576,12 @@ def main():
         choices=["ppo", "a2c"],
         help="RL algorithm to train with",
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of parallel training environments.",
+    )
     parser.add_argument("--steps", type=int, default=10000, help="Total training steps")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
@@ -572,6 +642,7 @@ def main():
     train_dexpoint(
         task_name=args.task,
         agent_name=args.agent,
+        num_envs=args.num_envs,
         total_timesteps=args.steps,
         learning_rate=args.lr,
         batch_size=args.batch_size,

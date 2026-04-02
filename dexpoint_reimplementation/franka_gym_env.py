@@ -52,6 +52,7 @@ class FrankaGymEnvironment(gym.Env):
         visualize_pointclouds: bool = False,
         pointcloud_point_size: int = 1,
         pointcloud_alpha: float = 0.2,
+        capture_episode_frames: bool = False,
     ):
         """
         Initialize the Franka gym environment.
@@ -72,6 +73,7 @@ class FrankaGymEnvironment(gym.Env):
             visualize_pointclouds: Whether to visualize point clouds in render output
             pointcloud_point_size: Size of rendered point cloud dots in pixels (default: 4)
             pointcloud_alpha: Transparency of point cloud overlay (0-1, default: 0.7)
+            capture_episode_frames: Whether to capture RGB frames on every step for debug videos
         """
         self.task_name = task_name
         self.num_points = num_points
@@ -83,6 +85,7 @@ class FrankaGymEnvironment(gym.Env):
         self.visualize_pointclouds = visualize_pointclouds
         self.pointcloud_point_size = pointcloud_point_size
         self.pointcloud_alpha = pointcloud_alpha
+        self.capture_episode_frames = capture_episode_frames
         self.robot_dof = 8
         self.joint_dim = self.robot_dof
         self.target_scale = float(target_scale)
@@ -328,10 +331,10 @@ class FrankaGymEnvironment(gym.Env):
         self.env.step()
         self.step_count += 1
 
-        # Capture frame for episode buffer
-        frame = self.render(mode="rgb_array")
-        if frame is not None:
-            self.episode_frames.append(frame)
+        if self.capture_episode_frames:
+            frame = self.render(mode="rgb_array")
+            if frame is not None:
+                self.episode_frames.append(frame)
 
         # Get observation
         obs = self._get_observation()
