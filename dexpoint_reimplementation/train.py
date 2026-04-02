@@ -153,7 +153,7 @@ def create_configured_environment(
     )
     task_config = create_task_config(
         task_name,
-        max_episode_steps=1000,
+        max_episode_steps=800,
         target_body_name=env.target_body_name,
     )
     env.configure_task(task_config)
