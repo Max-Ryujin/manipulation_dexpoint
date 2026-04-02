@@ -198,7 +198,7 @@ def train_dexpoint(
     verbose: int = 1,
     use_wandb: bool = False,
     record_video: bool = True,
-    video_interval: int = 20000,
+    video_interval: int = 100000,
     pointnet_checkpoint_path: Optional[str] = None,
     pointnet_variant: str = "auto",
     freeze_pointnet: bool = False,

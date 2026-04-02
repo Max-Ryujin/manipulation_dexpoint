@@ -276,6 +276,13 @@ class FrankaGymEnvironment(gym.Env):
         )
         return left_finger_pos, right_finger_pos
 
+    def get_gripper_opening_width(self) -> float:
+        left_finger_pos, right_finger_pos = self.get_finger_positions()
+        return float(np.linalg.norm(right_finger_pos - left_finger_pos))
+
+    def get_gripper_actuator_force(self) -> float:
+        return float(self.env.data.actuator_force[7])
+
     def get_end_effector_position(self) -> np.ndarray:
         return self.env.data.site_xpos[self.attachment_site_id].astype(np.float32)
 

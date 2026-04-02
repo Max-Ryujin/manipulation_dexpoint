@@ -19,6 +19,11 @@ class GraspingTask:
     GOAL_DISTANCE_OFFSET = 0.5
     FINGER_HEIGHT_ALIGNMENT_SCALE = 0.02
     FINGER_HEIGHT_ALIGNMENT_TOLERANCE = 0.02
+    GRASP_REWARD_SCALE = 0.1
+    GRASP_CENTERING_TOLERANCE = 0.03
+    GRASP_ACTUATOR_FORCE_THRESHOLD = 2.0
+    GRASP_ACTUATOR_FORCE_TOLERANCE = 10.0
+    GRASP_BETWEEN_FINGERS_MARGIN = 0.01
 
     @staticmethod
     def get_default_config() -> Dict[str, Any]:
@@ -37,6 +42,11 @@ class GraspingTask:
             "time_penalty": GraspingTask.TIME_PENALTY,
             "reach_distance_offset": GraspingTask.REACH_DISTANCE_OFFSET,
             "goal_distance_offset": GraspingTask.GOAL_DISTANCE_OFFSET,
+            "grasp_reward_scale": GraspingTask.GRASP_REWARD_SCALE,
+            "grasp_centering_tolerance": GraspingTask.GRASP_CENTERING_TOLERANCE,
+            "grasp_actuator_force_threshold": GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
+            "grasp_actuator_force_tolerance": GraspingTask.GRASP_ACTUATOR_FORCE_TOLERANCE,
+            "grasp_between_fingers_margin": GraspingTask.GRASP_BETWEEN_FINGERS_MARGIN,
         }
 
     @staticmethod
@@ -66,6 +76,12 @@ class GraspingTask:
         left_finger_pos, right_finger_pos = env.get_finger_positions()
         target_pos = env.get_target_position()
         goal_pos = env.goal_position
+        finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
+        finger_span_vector = right_finger_pos - left_finger_pos
+        finger_span = float(np.linalg.norm(finger_span_vector))
+        target_to_finger_midpoint = float(np.linalg.norm(target_pos - finger_midpoint))
+        gripper_opening_width = env.get_gripper_opening_width()
+        gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
 
         reach_distance = float(np.linalg.norm(ee_pos - target_pos))
         ee_target_xy_distance = float(np.linalg.norm(ee_pos[:2] - target_pos[:2]))
@@ -123,6 +139,33 @@ class GraspingTask:
                 GraspingTask.FINGER_HEIGHT_ALIGNMENT_TOLERANCE,
             )
         )
+        grasp_reward_scale = float(
+            env.task_config.get("grasp_reward_scale", GraspingTask.GRASP_REWARD_SCALE)
+        )
+        grasp_centering_tolerance = float(
+            env.task_config.get(
+                "grasp_centering_tolerance",
+                GraspingTask.GRASP_CENTERING_TOLERANCE,
+            )
+        )
+        grasp_actuator_force_threshold = float(
+            env.task_config.get(
+                "grasp_actuator_force_threshold",
+                GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
+            )
+        )
+        grasp_actuator_force_tolerance = float(
+            env.task_config.get(
+                "grasp_actuator_force_tolerance",
+                GraspingTask.GRASP_ACTUATOR_FORCE_TOLERANCE,
+            )
+        )
+        grasp_between_fingers_margin = float(
+            env.task_config.get(
+                "grasp_between_fingers_margin",
+                GraspingTask.GRASP_BETWEEN_FINGERS_MARGIN,
+            )
+        )
 
         reach_reward = reach_reward_scale * (reach_distance_offset - reach_distance)
         reward += reach_reward
@@ -133,6 +176,52 @@ class GraspingTask:
             - (finger_height_difference / max(finger_height_alignment_tolerance, 1e-6)),
         )
         reward += finger_height_alignment_reward
+
+        target_half_extent = float(np.max(env.target_spec.half_extents))
+        target_projection_distance = 0.0
+        target_lateral_distance = target_to_finger_midpoint
+        between_fingers_score = 0.0
+        target_between_fingers = False
+        if finger_span > 1e-6:
+            finger_span_axis = finger_span_vector / finger_span
+            target_offset = target_pos - finger_midpoint
+            target_projection = float(np.dot(target_offset, finger_span_axis))
+            target_projection_distance = float(abs(target_projection))
+            target_lateral_offset = target_offset - (
+                target_projection * finger_span_axis
+            )
+            target_lateral_distance = float(np.linalg.norm(target_lateral_offset))
+
+            max_projection_distance = (
+                0.5 * finger_span + target_half_extent + grasp_between_fingers_margin
+            )
+            target_between_fingers = (
+                target_projection_distance <= max_projection_distance
+            )
+            between_fingers_score = max(
+                0.0,
+                1.0
+                - (
+                    target_lateral_distance
+                    / max(
+                        grasp_centering_tolerance + target_half_extent,
+                        1e-6,
+                    )
+                ),
+            )
+            between_fingers_score *= float(target_between_fingers)
+
+        grasp_resistance_score = np.clip(
+            (gripper_actuator_force - grasp_actuator_force_threshold)
+            / max(grasp_actuator_force_tolerance, 1e-6),
+            0.0,
+            1.0,
+        )
+        grasp_detected = bool(target_between_fingers and grasp_resistance_score > 0.0)
+        grasp_reward = (
+            grasp_reward_scale * between_fingers_score * float(grasp_resistance_score)
+        )
+        reward += grasp_reward
 
         goal_reward = 0.0
         goal_reward_active = reach_distance <= goal_reward_activation_distance
@@ -155,6 +244,12 @@ class GraspingTask:
                 "ee_target_xy_distance": ee_target_xy_distance,
                 "ee_target_z_distance": ee_target_z_distance,
                 "finger_height_difference": finger_height_difference,
+                "finger_span": finger_span,
+                "target_to_finger_midpoint": target_to_finger_midpoint,
+                "target_projection_distance": target_projection_distance,
+                "target_lateral_distance": target_lateral_distance,
+                "gripper_opening_width": gripper_opening_width,
+                "gripper_actuator_force": gripper_actuator_force,
                 "goal_distance": goal_distance,
                 "goal_xy_distance": goal_xy_distance,
                 "goal_z_distance": goal_z_distance,
@@ -162,6 +257,11 @@ class GraspingTask:
                 "target_lift": target_lift,
                 "reach_reward": reach_reward,
                 "finger_height_alignment_reward": finger_height_alignment_reward,
+                "between_fingers_score": between_fingers_score,
+                "grasp_resistance_score": float(grasp_resistance_score),
+                "grasp_reward": grasp_reward,
+                "target_between_fingers": target_between_fingers,
+                "grasp_detected": grasp_detected,
                 "goal_reward": goal_reward,
                 "time_penalty": time_penalty,
                 "success_bonus": success_bonus,
