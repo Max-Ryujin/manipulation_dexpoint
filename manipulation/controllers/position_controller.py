@@ -46,8 +46,14 @@ class PositionController(BaseController):
         self.data = data
         self.status = ControllerStatus.IDLE
         self.trajectory = []
+        self.gripper_ctrl_min = float(self.model.actuator_ctrlrange[7, 0])
+        self.gripper_ctrl_max = float(self.model.actuator_ctrlrange[7, 1])
+        self.gripper_tolerance = max(
+            1e-4,
+            0.05 * abs(self.gripper_ctrl_max - self.gripper_ctrl_min),
+        )
 
-    def step(self, delta: float = 0.1, grasping_delta: float = 0.3):
+    def step(self, delta: float = 0.1, grasping_delta: float = None):
         if self.status == ControllerStatus.IDLE:
             if self.trajectory:
                 self.status = ControllerStatus.MOVING
@@ -76,7 +82,10 @@ class PositionController(BaseController):
         if self.status == ControllerStatus.GRASPING:
             ctrl = self.data.ctrl[7]
             qpos = self.data.qpos[7]
-            if np.linalg.norm(ctrl - qpos) < grasping_delta:
+            tolerance = self.gripper_tolerance
+            if grasping_delta is not None:
+                tolerance = max(float(grasping_delta), self.gripper_tolerance)
+            if np.linalg.norm(ctrl - qpos) < tolerance:
                 self.status = ControllerStatus.IDLE
                 return
 
@@ -99,11 +108,11 @@ class PositionController(BaseController):
         self.trajectory = []
 
     def open_gripper(self):
-        self.data.ctrl[7] = 0.04
+        self.data.ctrl[7] = self.gripper_ctrl_max
         self.status = ControllerStatus.GRASPING
 
     def close_gripper(self):
-        self.data.ctrl[7] = -0.2
+        self.data.ctrl[7] = self.gripper_ctrl_min
         self.status = ControllerStatus.GRASPING
 
     def follow_trajectory(self, trajectory: List[np.ndarray]):

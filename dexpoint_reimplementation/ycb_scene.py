@@ -126,6 +126,29 @@ def _find_obj_texture(mesh_path: Path) -> Optional[Path]:
     return None
 
 
+def _load_obj_vertices(mesh_path: Path) -> np.ndarray:
+    vertices = []
+    with mesh_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if not line.startswith("v "):
+                continue
+            parts = line.strip().split()
+            if len(parts) < 4:
+                continue
+            vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    if not vertices:
+        raise ValueError(f"OBJ mesh does not contain any vertices: {mesh_path}")
+
+    return np.asarray(vertices, dtype=np.float32)
+
+
+def _load_visual_geometry_points(mesh_path: Path, pointcloud_path: Path) -> np.ndarray:
+    if mesh_path.suffix.lower() == ".obj":
+        return _load_obj_vertices(mesh_path)
+    return clean_points(load_ply_vertices(pointcloud_path))
+
+
 def _find_dynamic_material(root: ET.Element) -> ET.Element:
     asset = _require_element(root, ".//asset")
     for material in asset.findall("material"):
@@ -160,7 +183,7 @@ def load_ycb_object_spec(
         )
     texture_path = _find_obj_texture(mesh_path.resolve())
 
-    points = clean_points(load_ply_vertices(pointcloud_path))
+    points = _load_visual_geometry_points(mesh_path, pointcloud_path)
     mins = points.min(axis=0)
     maxs = points.max(axis=0)
     half_extents = 0.5 * (maxs - mins)

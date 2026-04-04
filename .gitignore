@@ -71,3 +71,6 @@ slurm
 slurm_cpu
 data/
 log/
+*.png
+*.csv
+*.mp4

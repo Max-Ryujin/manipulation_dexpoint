@@ -167,9 +167,6 @@ class FrankaGymEnvironment(gym.Env):
         self.max_episode_steps = 800
         self.step_count = 0
 
-        # Frame buffering for edge case debugging
-        self.frame_buffer = deque(maxlen=self.max_episode_steps)
-        self.episode_frames = []
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
         self._last_pointcloud_size = 0
@@ -184,7 +181,7 @@ class FrankaGymEnvironment(gym.Env):
             self._reset_target_pose()
 
         # Step a few times to settle simulation
-        for _ in range(10):
+        for _ in range(5):
             self.env.step()
 
         target_pos = self.get_target_position()
@@ -194,8 +191,6 @@ class FrankaGymEnvironment(gym.Env):
         self.step_count = 0
 
         # Clear frame buffer for new episode
-        self.frame_buffer.clear()
-        self.episode_frames = []
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
         self._last_pointcloud_size = 0
@@ -290,6 +285,10 @@ class FrankaGymEnvironment(gym.Env):
         )
         return left_finger_pos, right_finger_pos
 
+    def get_finger_midpoint_position(self) -> np.ndarray:
+        left_finger_pos, right_finger_pos = self.get_finger_positions()
+        return (0.5 * (left_finger_pos + right_finger_pos)).astype(np.float32)
+
     def get_gripper_opening_width(self) -> float:
         left_finger_pos, right_finger_pos = self.get_finger_positions()
         return float(np.linalg.norm(right_finger_pos - left_finger_pos))
@@ -311,6 +310,31 @@ class FrankaGymEnvironment(gym.Env):
 
     def get_end_effector_position(self) -> np.ndarray:
         return self.env.data.site_xpos[self.attachment_site_id].astype(np.float32)
+
+    def get_end_effector_down_alignment(self) -> float:
+        rotation = self.env.data.site_xmat[self.attachment_site_id].reshape(3, 3)
+        approach_axis = rotation[:, 2]
+        return float(np.clip(-approach_axis[2], 0.0, 1.0))
+
+    def get_gripper_target_contact_score(self) -> float:
+        target_body_id = self.env.model.body(self.target_body_name).id
+        finger_body_ids = {
+            self.env.model.body("left_finger").id,
+            self.env.model.body("right_finger").id,
+        }
+        contacted_fingers = set()
+
+        for index in range(self.env.data.ncon):
+            contact = self.env.data.contact[index]
+            body1 = int(self.env.model.geom_bodyid[contact.geom1])
+            body2 = int(self.env.model.geom_bodyid[contact.geom2])
+
+            if body1 == target_body_id and body2 in finger_body_ids:
+                contacted_fingers.add(body2)
+            elif body2 == target_body_id and body1 in finger_body_ids:
+                contacted_fingers.add(body1)
+
+        return float(len(contacted_fingers) / 2.0)
 
     def step(
         self, action: np.ndarray
@@ -387,7 +411,6 @@ class FrankaGymEnvironment(gym.Env):
             info.update(action_metrics)
             done = True
             reward = 0.0
-            self.episode_frames = []
             return obs, reward, done, info
 
         # Compute task-specific reward and done signal
@@ -404,10 +427,6 @@ class FrankaGymEnvironment(gym.Env):
         if self.step_count >= self.max_episode_steps:
             done = True
             info["step_limit_reached"] = True
-
-        # Clear frames on successful episode completion
-        if done:
-            self.episode_frames = []
 
         return obs, reward, done, info
 
@@ -435,21 +454,6 @@ class FrankaGymEnvironment(gym.Env):
                 f"step={self.step_count} hand_pos={np.array2string(hand_pos, precision=3)} "
                 f"max_joint_speed={max_joint_speed:.3f} contacts={int(self.env.data.ncon)}"
             )
-
-            # Save debug images and video of current episode
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            debug_dir = Path(f"debug_no_points_{timestamp}")
-            debug_dir.mkdir(exist_ok=True)
-
-            # Save individual frames from each camera
-            for name in self.camera_names:
-                image = self.render(mode=f"camera_{name}")
-                cv2.imwrite(str(debug_dir / f"debug_{name}.png"), image)
-
-            # Save episode video if frames were captured
-            if len(self.episode_frames) > 0:
-                video_path = debug_dir / f"episode_video_{timestamp}.mp4"
-                imageio.mimwrite(str(video_path), self.episode_frames, fps=30)
 
             self._last_pointcloud_empty = True
             joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)

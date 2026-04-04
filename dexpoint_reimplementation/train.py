@@ -192,9 +192,9 @@ def train_dexpoint(
     total_timesteps: int = 100000,
     learning_rate: float = 3e-4,
     batch_size: int = 64,
-    n_epochs: int = 5,
+    n_epochs: int = 8,
     n_steps: int = 1600,
-    save_interval: int = 20000,
+    save_interval: int = 100000,
     verbose: int = 1,
     use_wandb: bool = False,
     record_video: bool = True,
@@ -214,8 +214,8 @@ def train_dexpoint(
         total_timesteps: Total training timesteps
         learning_rate: Learning rate for Adam optimizer
         batch_size: Batch size for PPO updates
-        n_epochs: Number of PPO policy update epochs per rollout
-        n_steps: Number of steps to collect per update
+        n_epochs: Number of PPO policy update epochs per update
+        n_steps: Number of steps to collect per rollout before each policy update
         save_interval: Save model every N timesteps
         verbose: Verbosity level (0=silent, 1=verbose)
         use_wandb: Enable Weights & Biases logging
@@ -316,7 +316,7 @@ def train_dexpoint(
             n_steps=n_steps,
             batch_size=batch_size,
             n_epochs=n_epochs,
-            gamma=0.99,
+            gamma=0.992,
             gae_lambda=0.95,
             clip_range=0.2,
             clip_range_vf=None,
@@ -344,8 +344,8 @@ def train_dexpoint(
             policy=DexPointPolicy,
             env=env,
             learning_rate=learning_rate,
-            n_steps=n_steps,
-            gamma=0.99,
+            n_steps=n_steps // 2,  # A2C typically uses shorter rollouts
+            gamma=0.992,
             gae_lambda=0.95,
             max_grad_norm=0.5,
             use_sde=False,
@@ -421,6 +421,7 @@ def train_dexpoint(
         steps_so_far = 0
         step_count = 0
         next_video_step = video_interval
+        video_recording_enabled = record_video and eval_env is not None
         video_frames = []
         training_callback = TaskInfoLoggingCallback(use_wandb=use_wandb)
 
@@ -445,7 +446,7 @@ def train_dexpoint(
             print(f"    Collected {actual_batch_steps} environment steps")
 
             # Record video if needed
-            if eval_env is not None and steps_so_far >= next_video_step:
+            if video_recording_enabled and steps_so_far >= next_video_step:
                 print(f"    Recording validation video...")
                 video_frames = []
                 obs = eval_env.reset()
@@ -482,19 +483,35 @@ def train_dexpoint(
                 # Save video
                 if video_frames:
                     video_path = run_dir / f"video_step_{steps_so_far}.mp4"
-                    imageio.mimwrite(video_path, video_frames, fps=30)
-                    print(f"    Video saved: {video_path}")
-                    if use_wandb and wandb.run is not None:
-                        wandb.log(
-                            {
-                                "validation/episode_reward": episode_reward,
-                                "validation/episode_steps": episode_steps,
-                                "validation/video": wandb.Video(
-                                    str(video_path), fps=30, format="mp4"
-                                ),
-                                "validation/episode_success": success,
-                            }
+                    try:
+                        imageio.mimwrite(video_path, video_frames, fps=30)
+                        print(f"    Video saved: {video_path}")
+                        if use_wandb and wandb.run is not None:
+                            wandb.log(
+                                {
+                                    "validation/episode_reward": episode_reward,
+                                    "validation/episode_steps": episode_steps,
+                                    "validation/video": wandb.Video(
+                                        str(video_path), format="mp4"
+                                    ),
+                                    "validation/episode_success": success,
+                                }
+                            )
+                    except (FileNotFoundError, OSError) as exc:
+                        video_recording_enabled = False
+                        print(
+                            "    Video recording disabled for the rest of this run: "
+                            f"{exc}"
                         )
+                        if use_wandb and wandb.run is not None:
+                            wandb.log(
+                                {
+                                    "validation/episode_reward": episode_reward,
+                                    "validation/episode_steps": episode_steps,
+                                    "validation/episode_success": success,
+                                    "validation/video_error": str(exc),
+                                }
+                            )
                 elif use_wandb and wandb.run is not None:
                     wandb.log(
                         {

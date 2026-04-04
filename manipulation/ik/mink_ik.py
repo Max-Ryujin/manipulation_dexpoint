@@ -25,6 +25,7 @@ class MinkIK(BaseIK):
         self.ee_task = None
         self.posture_task = None
         self.target_name = target_name
+        self._target_transform = None
 
         self.configuration = mink.Configuration(model)
 
@@ -62,12 +63,24 @@ class MinkIK(BaseIK):
         return tasks
 
     def set_target_position(self, pos: np.ndarray, quat: np.ndarray):
-        self.data.mocap_pos[0] = pos
-        self.data.mocap_quat[0] = quat
+        rotation_matrix = np.zeros(9, dtype=np.float64)
+        mujoco.mju_quat2Mat(rotation_matrix, quat)
+        rotation = mink.SO3.from_matrix(rotation_matrix.reshape(3, 3))
+        self._target_transform = mink.SE3.from_rotation_and_translation(rotation, pos)
+
+        if self.data.mocap_pos.shape[0] > 0:
+            self.data.mocap_pos[0] = pos
+        if self.data.mocap_quat.shape[0] > 0:
+            self.data.mocap_quat[0] = quat
 
     def converge_ik(self, dt: float) -> bool:
         # Update the end effector task target from the mocap body
-        T_wt = mink.SE3.from_mocap_name(self.model, self.data, self.target_name)
+        if self.data.mocap_pos.shape[0] > 0:
+            T_wt = mink.SE3.from_mocap_name(self.model, self.data, self.target_name)
+        elif self._target_transform is not None:
+            T_wt = self._target_transform
+        else:
+            raise RuntimeError("IK target is not set before converge_ik().")
         self.ee_task.set_target(T_wt)
 
         self.posture_task.set_target_from_configuration(self.configuration)
