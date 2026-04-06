@@ -17,7 +17,9 @@ from manipulation.perception import MujocoCamera
 from pointcloud_observation import (
     center_and_sample_pointcloud,
     collect_fused_pointcloud,
+    collect_fused_pointcloud_for_training,
     get_workspace_configuration,
+    POINTCLOUD_OVERSAMPLE_FACTOR,
 )
 from ycb_scene import (
     DEFAULT_YCB_OBJECT_ROOT,
@@ -53,6 +55,7 @@ class FrankaGymEnvironment(gym.Env):
         pointcloud_point_size: int = 1,
         pointcloud_alpha: float = 0.2,
         capture_episode_frames: bool = False,
+        use_depth_only_pointcloud: bool = False,
     ):
         """
         Initialize the Franka gym environment.
@@ -86,6 +89,7 @@ class FrankaGymEnvironment(gym.Env):
         self.pointcloud_point_size = pointcloud_point_size
         self.pointcloud_alpha = pointcloud_alpha
         self.capture_episode_frames = capture_episode_frames
+        self.use_depth_only_pointcloud = use_depth_only_pointcloud
         self.robot_dof = 8
         self.joint_dim = self.robot_dof
         self.target_scale = float(target_scale)
@@ -285,6 +289,14 @@ class FrankaGymEnvironment(gym.Env):
         )
         return left_finger_pos, right_finger_pos
 
+    def get_left_finger_position(self) -> np.ndarray:
+        left, _ = self.get_finger_positions()
+        return left
+
+    def get_right_finger_position(self) -> np.ndarray:
+        _, right = self.get_finger_positions()
+        return right
+
     def get_finger_midpoint_position(self) -> np.ndarray:
         left_finger_pos, right_finger_pos = self.get_finger_positions()
         return (0.5 * (left_finger_pos + right_finger_pos)).astype(np.float32)
@@ -432,16 +444,28 @@ class FrankaGymEnvironment(gym.Env):
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Extract point cloud and proprioceptive observations from all cameras."""
-        merged_points = collect_fused_pointcloud(
-            self.env,
-            self.camera,
-            camera_names=self.camera_names,
-            num_points=self.num_points,
-            camera_height=self.camera_height,
-            camera_width=self.camera_width,
-            workspace_bounds=self.workspace_bounds,
-            table_height=self.table_height,
-        )
+        if self.use_depth_only_pointcloud:
+            merged_points = collect_fused_pointcloud_for_training(
+                self.env,
+                self.camera,
+                camera_names=self.camera_names,
+                num_points=self.num_points,
+                camera_height=self.camera_height,
+                camera_width=self.camera_width,
+                workspace_bounds=self.workspace_bounds,
+                table_height=self.table_height,
+            )
+        else:
+            merged_points = collect_fused_pointcloud(
+                self.env,
+                self.camera,
+                camera_names=self.camera_names,
+                num_points=self.num_points,
+                camera_height=self.camera_height,
+                camera_width=self.camera_width,
+                workspace_bounds=self.workspace_bounds,
+                table_height=self.table_height,
+            )
         self._last_pointcloud_size = int(len(merged_points))
 
         if len(merged_points) == 0:
@@ -589,7 +613,7 @@ class FrankaGymEnvironment(gym.Env):
 
             # Get point cloud for this camera
             # Use only the points from this specific camera to avoid confusion
-            samples_per_camera = 50 * self.num_points
+            samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * self.num_points
             points, colors, pixels, depths = self.camera.get_pointcloud(
                 camera_name,
                 width=self.camera_width,

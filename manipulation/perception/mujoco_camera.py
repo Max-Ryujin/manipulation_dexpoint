@@ -1,6 +1,12 @@
 """MuJoCo camera rendering and pointcloud generation utilities."""
 
+import contextlib
 import os
+import sys
+
+
+_VALIDATED_EGL_DEVICE_ID = None
+_EGL_DEVICE_PROBE_ATTEMPTED = False
 
 if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
     os.environ["MUJOCO_GL"] = "egl"
@@ -12,6 +18,78 @@ from typing import Optional, List, Tuple, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from manipulation.core.base_env import BaseEnvironment
+
+
+@contextlib.contextmanager
+def _suppress_stderr_fd():
+    """Temporarily redirect OS-level stderr to suppress libEGL probe noise."""
+    sys.stderr.flush()
+    saved_stderr_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
+
+
+def _configure_egl_device() -> None:
+    """Pick a working EGL device id once per process when running headless."""
+    global _VALIDATED_EGL_DEVICE_ID, _EGL_DEVICE_PROBE_ATTEMPTED
+
+    if os.environ.get("MUJOCO_GL") != "egl" or _EGL_DEVICE_PROBE_ATTEMPTED:
+        return
+
+    _EGL_DEVICE_PROBE_ATTEMPTED = True
+
+    try:
+        import mujoco.egl as mujoco_egl
+    except ImportError:
+        return
+
+    preferred_device = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+    previous_device = preferred_device
+
+    with _suppress_stderr_fd():
+        try:
+            device_count = len(mujoco_egl.EGL.eglQueryDevicesEXT())
+        except Exception:
+            return
+
+    candidate_ids = []
+    if preferred_device is not None:
+        try:
+            preferred_index = int(preferred_device)
+        except ValueError:
+            preferred_index = None
+        else:
+            if 0 <= preferred_index < device_count:
+                candidate_ids.append(preferred_index)
+
+    candidate_ids.extend(
+        device_id for device_id in range(device_count) if device_id not in candidate_ids
+    )
+
+    for device_id in candidate_ids:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(device_id)
+        with _suppress_stderr_fd():
+            try:
+                display = mujoco_egl.create_initialized_egl_device_display()
+            except Exception:
+                display = mujoco_egl.EGL.EGL_NO_DISPLAY
+
+        if display != mujoco_egl.EGL.EGL_NO_DISPLAY:
+            with _suppress_stderr_fd():
+                mujoco_egl.EGL.eglTerminate(display)
+            _VALIDATED_EGL_DEVICE_ID = device_id
+            return
+
+    if previous_device is None:
+        os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
+    else:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = previous_device
 
 
 class MujocoCamera:
@@ -92,9 +170,16 @@ class MujocoCamera:
             self._height = height
 
         if self.renderer is None:
-            self.renderer = mujoco.Renderer(
-                self.env.get_model(), height=self._height, width=self._width
-            )
+            if os.environ.get("MUJOCO_GL") == "egl":
+                _configure_egl_device()
+                with _suppress_stderr_fd():
+                    self.renderer = mujoco.Renderer(
+                        self.env.get_model(), height=self._height, width=self._width
+                    )
+            else:
+                self.renderer = mujoco.Renderer(
+                    self.env.get_model(), height=self._height, width=self._width
+                )
 
     def get_camera_intrinsics(
         self,
@@ -372,6 +457,79 @@ class MujocoCamera:
         return (
             points_world.astype(np.float32),
             colors_sampled.astype(np.uint8),
+            pixel_coords.astype(np.int32),
+            depth_sampled.astype(np.float32),
+        )
+
+    def get_pointcloud_depth_only(
+        self,
+        camera_name: str,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        num_samples: int = 1000,
+        min_depth: float = 0.3,
+        max_depth: float = 3.0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generate point cloud from depth only.
+
+        This avoids the RGB render path when only xyz coordinates are needed,
+        which is the common training-time case for DexPoint observations.
+        """
+        depth = self.render_depth(camera_name, width, height)
+
+        img_height, img_width = depth.shape
+
+        fx, fy, cx, cy = self.get_camera_intrinsics(camera_name, img_width, img_height)
+
+        u_coords, v_coords = np.meshgrid(
+            np.arange(img_width, dtype=np.float32),
+            np.arange(img_height, dtype=np.float32),
+            indexing="xy",
+        )
+
+        u_flat = u_coords.ravel()
+        v_flat = v_coords.ravel()
+        depth_flat = depth.ravel()
+
+        valid_mask = (
+            (depth_flat >= min_depth)
+            & (depth_flat <= max_depth)
+            & np.isfinite(depth_flat)
+        )
+        valid_indices = np.where(valid_mask)[0]
+
+        if len(valid_indices) == 0:
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 2), dtype=np.int32),
+                np.zeros((0,), dtype=np.float32),
+            )
+
+        if len(valid_indices) > num_samples:
+            sampled_indices = np.random.choice(
+                valid_indices, size=num_samples, replace=False
+            )
+        else:
+            sampled_indices = valid_indices
+
+        u_sampled = u_flat[sampled_indices]
+        v_sampled = v_flat[sampled_indices]
+        depth_sampled = depth_flat[sampled_indices]
+        pixel_coords = np.stack([u_sampled, v_sampled], axis=1)
+
+        x_cam = (u_sampled - cx) * depth_sampled / fx
+        y_cam = (v_sampled - cy) * depth_sampled / fy
+        z_cam = depth_sampled
+        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
+
+        cam_pos, cam_rot = self._get_camera_pose(camera_name)
+        R_correction = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
+        R_total = cam_rot @ R_correction
+        points_world = (R_total @ points_cam.T).T + cam_pos
+
+        return (
+            points_world.astype(np.float32),
             pixel_coords.astype(np.int32),
             depth_sampled.astype(np.float32),
         )

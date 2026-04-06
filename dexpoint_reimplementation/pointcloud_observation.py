@@ -9,6 +9,7 @@ import numpy as np
 
 
 DEFAULT_CAMERA_NAMES = ("top_camera", "side_camera", "front_camera")
+POINTCLOUD_OVERSAMPLE_FACTOR = 40
 
 
 def get_default_camera_names() -> list[str]:
@@ -78,7 +79,7 @@ def collect_fused_pointcloud(
     hand_sphere_radius: float = 0.12,
 ) -> np.ndarray:
     all_points: list[np.ndarray] = []
-    samples_per_camera = 50 * num_points
+    samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * num_points
 
     min_x = workspace_bounds["min_x"]
     max_x = workspace_bounds["max_x"]
@@ -91,6 +92,72 @@ def collect_fused_pointcloud(
 
     for camera_name in camera_names:
         points, _colors, _pixels, _depths = camera.get_pointcloud(
+            camera_name,
+            width=camera_width,
+            height=camera_height,
+            num_samples=samples_per_camera,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+
+        if len(points) == 0:
+            continue
+
+        workspace_mask = (
+            (points[:, 0] >= min_x)
+            & (points[:, 0] <= max_x)
+            & (points[:, 1] >= min_y)
+            & (points[:, 1] <= max_y)
+            & (points[:, 2] > (min_z + min_height_above_table))
+            & (points[:, 2] < (min_z + max_height_above_table))
+        )
+
+        dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
+        hand_mask = dist_to_hand < hand_sphere_radius
+        mask = workspace_mask | hand_mask
+        filtered_points = points[mask]
+
+        if len(filtered_points) > 0:
+            all_points.append(filtered_points)
+
+    if not all_points:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    return np.vstack(all_points).astype(np.float32, copy=False)
+
+
+def collect_fused_pointcloud_for_training(
+    env,
+    camera,
+    *,
+    camera_names: Sequence[str],
+    num_points: int,
+    camera_height: int,
+    camera_width: int,
+    workspace_bounds: dict[str, float],
+    table_height: float,
+    hand_body_name: str = "hand",
+    min_depth: float = 0.1,
+    max_depth: float = 3.0,
+    max_height_above_table: float = 0.2,
+    min_height_above_table: float = 0.01,
+    hand_sphere_radius: float = 0.12,
+) -> np.ndarray:
+    """Collect a fused point cloud for training using depth only."""
+    all_points: list[np.ndarray] = []
+    samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * num_points
+
+    min_x = workspace_bounds["min_x"]
+    max_x = workspace_bounds["max_x"]
+    min_y = workspace_bounds["min_y"]
+    max_y = workspace_bounds["max_y"]
+    min_z = table_height
+
+    hand_id = env.model.body(hand_body_name).id
+    hand_pos = env.data.xpos[hand_id]
+
+    for camera_name in camera_names:
+        points, _pixels, _depths = camera.get_pointcloud_depth_only(
             camera_name,
             width=camera_width,
             height=camera_height,

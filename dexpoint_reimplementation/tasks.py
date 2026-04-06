@@ -61,7 +61,9 @@ class GraspingTask:
         done = False
         info = {"task": GraspingTask.NAME, "step": env.step_count}
 
-        target_pos = env.get_target_position()
+        target_pos = env.get_target_position() + np.array(
+            [0.0, 0.0, 0.01]
+        )  # Slightly above target center for better grasping
         goal_pos = env.goal_position
         ee_pos = env.get_end_effector_position()
         finger_midpoint = env.get_finger_midpoint_position()
@@ -79,23 +81,79 @@ class GraspingTask:
         target_lift = float(target_pos[2] - env.target_rest_height)
         orientation_down_alignment = env.get_end_effector_down_alignment()
 
-        distance_scale = float(env.task_config.get("distance_scale", GraspingTask.DISTANCE_SCALE))
-        distance_reward_scale = float(env.task_config.get("distance_reward_scale", GraspingTask.DISTANCE_REWARD_SCALE))
-        orientation_threshold = float(env.task_config.get("orientation_threshold", GraspingTask.ORIENTATION_THRESHOLD))
-        orientation_reward_scale = float(env.task_config.get("orientation_reward_scale", GraspingTask.ORIENTATION_REWARD_SCALE))
-        caging_distance = float(env.task_config.get("caging_distance", GraspingTask.CAGING_DISTANCE))
-        grasp_reward_scale = float(env.task_config.get("grasp_reward_scale", GraspingTask.GRASP_REWARD_SCALE))
-        force_threshold = float(env.task_config.get("grasp_actuator_force_threshold", GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD))
-        force_scale = float(env.task_config.get("grasp_actuator_force_scale", GraspingTask.GRASP_ACTUATOR_FORCE_SCALE))
-        grasp_width_tolerance = float(env.task_config.get("grasp_width_tolerance", GraspingTask.GRASP_WIDTH_TOLERANCE))
-        lift_clearance = float(env.task_config.get("lift_clearance", GraspingTask.LIFT_CLEARANCE))
-        lift_height_threshold = float(env.task_config.get("lift_height_threshold", GraspingTask.LIFT_HEIGHT_THRESHOLD))
-        lift_reward_scale = float(env.task_config.get("lift_reward_scale", GraspingTask.LIFT_REWARD_SCALE))
-        goal_height_tolerance = float(env.task_config.get("goal_height_tolerance", GraspingTask.GOAL_HEIGHT_TOLERANCE))
-        goal_height_reward_scale = float(env.task_config.get("goal_height_reward_scale", GraspingTask.GOAL_HEIGHT_REWARD_SCALE))
-        success_goal_height_threshold = float(env.task_config.get("success_goal_height_threshold", GraspingTask.SUCCESS_GOAL_HEIGHT_THRESHOLD))
-        success_bonus = float(env.task_config.get("success_bonus", GraspingTask.SUCCESS_BONUS))
-        time_penalty = -float(env.task_config.get("time_penalty", GraspingTask.TIME_PENALTY))
+        distance_scale = float(
+            env.task_config.get("distance_scale", GraspingTask.DISTANCE_SCALE)
+        )
+        distance_reward_scale = float(
+            env.task_config.get(
+                "distance_reward_scale", GraspingTask.DISTANCE_REWARD_SCALE
+            )
+        )
+        orientation_threshold = float(
+            env.task_config.get(
+                "orientation_threshold", GraspingTask.ORIENTATION_THRESHOLD
+            )
+        )
+        orientation_reward_scale = float(
+            env.task_config.get(
+                "orientation_reward_scale", GraspingTask.ORIENTATION_REWARD_SCALE
+            )
+        )
+        caging_distance = float(
+            env.task_config.get("caging_distance", GraspingTask.CAGING_DISTANCE)
+        )
+        grasp_reward_scale = float(
+            env.task_config.get("grasp_reward_scale", GraspingTask.GRASP_REWARD_SCALE)
+        )
+        force_threshold = float(
+            env.task_config.get(
+                "grasp_actuator_force_threshold",
+                GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
+            )
+        )
+        force_scale = float(
+            env.task_config.get(
+                "grasp_actuator_force_scale", GraspingTask.GRASP_ACTUATOR_FORCE_SCALE
+            )
+        )
+        grasp_width_tolerance = float(
+            env.task_config.get(
+                "grasp_width_tolerance", GraspingTask.GRASP_WIDTH_TOLERANCE
+            )
+        )
+        lift_clearance = float(
+            env.task_config.get("lift_clearance", GraspingTask.LIFT_CLEARANCE)
+        )
+        lift_height_threshold = float(
+            env.task_config.get(
+                "lift_height_threshold", GraspingTask.LIFT_HEIGHT_THRESHOLD
+            )
+        )
+        lift_reward_scale = float(
+            env.task_config.get("lift_reward_scale", GraspingTask.LIFT_REWARD_SCALE)
+        )
+        goal_height_tolerance = float(
+            env.task_config.get(
+                "goal_height_tolerance", GraspingTask.GOAL_HEIGHT_TOLERANCE
+            )
+        )
+        goal_height_reward_scale = float(
+            env.task_config.get(
+                "goal_height_reward_scale", GraspingTask.GOAL_HEIGHT_REWARD_SCALE
+            )
+        )
+        success_goal_height_threshold = float(
+            env.task_config.get(
+                "success_goal_height_threshold",
+                GraspingTask.SUCCESS_GOAL_HEIGHT_THRESHOLD,
+            )
+        )
+        success_bonus = float(
+            env.task_config.get("success_bonus", GraspingTask.SUCCESS_BONUS)
+        )
+        time_penalty = -float(
+            env.task_config.get("time_penalty", GraspingTask.TIME_PENALTY)
+        )
 
         distance_score = 1.0 - np.tanh(reach_distance / max(distance_scale, 1e-6))
         orientation_score = np.clip(
@@ -104,17 +162,27 @@ class GraspingTask:
             0.0,
             1.0,
         )
-        caging_score = np.clip(1.0 - reach_distance / max(caging_distance, 1e-6), 0.0, 1.0)
-        force_score = np.clip((gripper_actuator_force - force_threshold) / max(force_scale, 1e-6), 0.0, 1.0)
+        caging_score = np.clip(
+            1.0 - reach_distance / max(caging_distance, 1e-6), 0.0, 1.0
+        )
+        force_score = np.clip(
+            (gripper_actuator_force - force_threshold) / max(force_scale, 1e-6),
+            0.0,
+            1.0,
+        )
         expected_grasp_width = 2.0 * float(np.max(env.target_spec.half_extents[:2]))
         width_match_score = np.clip(
-            1.0 - abs(gripper_opening_width - expected_grasp_width) / max(grasp_width_tolerance, 1e-6),
+            1.0
+            - abs(gripper_opening_width - expected_grasp_width)
+            / max(grasp_width_tolerance, 1e-6),
             0.0,
             1.0,
         )
         force_grasp_score = force_score * width_match_score
         contact_grasp_score = 1.0 if target_contact_score >= 1.0 else 0.0
-        between_fingers_score = max(float(width_match_score * caging_score), float(contact_grasp_score))
+        between_fingers_score = max(
+            float(width_match_score * caging_score), float(contact_grasp_score)
+        )
         grasp_evidence_score = max(float(force_grasp_score), float(contact_grasp_score))
         grasp_score = grasp_evidence_score * (0.5 + 0.5 * float(caging_score))
         lift_progress = np.clip(
@@ -123,7 +191,9 @@ class GraspingTask:
             0.0,
             1.0,
         )
-        goal_height_score = np.clip(1.0 - goal_z_distance / max(goal_height_tolerance, 1e-6), 0.0, 1.0)
+        goal_height_score = np.clip(
+            1.0 - goal_z_distance / max(goal_height_tolerance, 1e-6), 0.0, 1.0
+        )
 
         distance_reward = distance_reward_scale * float(distance_score)
         orientation_reward = orientation_reward_scale * float(orientation_score)
@@ -131,11 +201,21 @@ class GraspingTask:
         lift_reward = lift_reward_scale * float(lift_progress)
         goal_height_reward = goal_height_reward_scale * float(goal_height_score)
 
-        reward = distance_reward + orientation_reward + grasp_reward + lift_reward + goal_height_reward + time_penalty
+        reward = (
+            distance_reward
+            + orientation_reward
+            + grasp_reward
+            + lift_reward
+            + goal_height_reward
+            + time_penalty
+        )
         grasp_detected = bool(grasp_evidence_score > 0.25 and caging_score > 0.25)
-        target_between_fingers = bool(between_fingers_score > 0.5 and caging_score > 0.25)
+        target_between_fingers = bool(
+            between_fingers_score > 0.5 and caging_score > 0.25
+        )
         is_success = bool(
-            target_lift >= lift_height_threshold and goal_z_distance <= success_goal_height_threshold
+            target_lift >= lift_height_threshold
+            and goal_z_distance <= success_goal_height_threshold
         )
         if is_success:
             reward += success_bonus
@@ -182,6 +262,76 @@ class GraspingTask:
                 "reward_total": reward,
             }
         )
+        return reward, done, info
+
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        reward = 0.0
+        done = False
+        info = {"task": GraspingTask.NAME, "step": env.step_count}
+
+        # --- State ---
+        target_pos = env.get_target_position() + np.array(
+            [0.0, 0.0, 0.01]
+        )  # Slightly above target center for better grasping
+        ee_pos = env.get_end_effector_position()
+        finger_midpoint = env.get_finger_midpoint_position()
+        lfinger_pos = env.get_left_finger_position()
+        rfinger_pos = env.get_right_finger_position()
+
+        goal_pos = env.goal_position
+
+        reach_distance = float(np.linalg.norm(target_pos - finger_midpoint))
+        ee_object_distance = float(np.linalg.norm(target_pos - ee_pos))
+        goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
+
+        lfinger_dist = float(np.linalg.norm(lfinger_pos - target_pos))
+        rfinger_dist = float(np.linalg.norm(rfinger_pos - target_pos))
+        finger_dist = 0.5 * (lfinger_dist + rfinger_dist)
+
+        target_lift = float(target_pos[2] - env.target_rest_height)
+
+        distance_scale = float(env.task_config.get("distance_scale", 0.1))
+        lift_height_threshold = float(env.task_config.get("lift_height_threshold", 0.1))
+
+        reach_score = 1.0 - np.tanh(reach_distance / max(distance_scale, 1e-6))
+
+        finger_score = 1.0 - np.tanh(finger_dist / max(distance_scale, 1e-6))
+
+        caging_score = 1.0 - np.tanh(reach_distance / 0.05)
+
+        lift_score = np.clip(target_lift / max(lift_height_threshold, 1e-6), 0.0, 1.0)
+
+        w_reach = 1.0
+        w_finger = 1.0
+        w_caging = 0.5
+        w_lift = 2.0
+
+        reward = (
+            w_reach * reach_score
+            + w_finger * finger_score
+            + w_caging * caging_score
+            + w_lift * lift_score
+        )
+
+        is_success = bool(target_lift >= lift_height_threshold)
+        if is_success:
+            reward += 5.0
+            done = True
+
+        info.update(
+            {
+                "reach_distance": reach_distance,
+                "finger_dist": finger_dist,
+                "target_lift": target_lift,
+                "reach_score": reach_score,
+                "finger_score": finger_score,
+                "caging_score": caging_score,
+                "lift_score": lift_score,
+                "is_success": is_success,
+                "reward_total": reward,
+            }
+        )
+
         return reward, done, info
 
 

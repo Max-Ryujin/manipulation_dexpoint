@@ -137,6 +137,7 @@ def create_configured_environment(
     visualize_pointclouds: bool,
     pointcloud_point_size: int = 1,
     pointcloud_alpha: float = 0.7,
+    use_depth_only_pointcloud: bool = False,
 ) -> FrankaGymEnvironment:
     """Build and configure a FrankaGymEnvironment for training or evaluation."""
     env = FrankaGymEnvironment(
@@ -151,6 +152,7 @@ def create_configured_environment(
         visualize_pointclouds=visualize_pointclouds,
         pointcloud_point_size=pointcloud_point_size,
         pointcloud_alpha=pointcloud_alpha,
+        use_depth_only_pointcloud=use_depth_only_pointcloud,
     )
     task_config = create_task_config(
         task_name,
@@ -167,6 +169,7 @@ def make_environment_factory(
     visualize_pointclouds: bool,
     pointcloud_point_size: int = 1,
     pointcloud_alpha: float = 0.7,
+    use_depth_only_pointcloud: bool = False,
     seed: Optional[int] = None,
 ) -> Callable[[], FrankaGymEnvironment]:
     """Create a picklable environment factory for vectorized rollouts."""
@@ -177,6 +180,7 @@ def make_environment_factory(
             visualize_pointclouds=visualize_pointclouds,
             pointcloud_point_size=pointcloud_point_size,
             pointcloud_alpha=pointcloud_alpha,
+            use_depth_only_pointcloud=use_depth_only_pointcloud,
         )
         if seed is not None:
             env.seed(seed)
@@ -273,6 +277,7 @@ def train_dexpoint(
     reference_env = create_configured_environment(
         task_name,
         visualize_pointclouds=False,
+        use_depth_only_pointcloud=True,
     )
     env = reference_env
     if num_envs > 1:
@@ -282,6 +287,7 @@ def train_dexpoint(
                 make_environment_factory(
                     task_name,
                     visualize_pointclouds=False,
+                    use_depth_only_pointcloud=True,
                     seed=env_index,
                 )
                 for env_index in range(num_envs)
@@ -291,6 +297,7 @@ def train_dexpoint(
         create_configured_environment(
             task_name,
             visualize_pointclouds=True,
+            use_depth_only_pointcloud=False,
         )
         if record_video
         else None
@@ -402,6 +409,7 @@ def train_dexpoint(
         "env_config": {
             "num_points": 512,
             "camera_names": ["top_camera", "side_camera", "front_camera"],
+            "use_depth_only_pointcloud": True,
             "target_body_name": reference_env.target_body_name,
             "ycb_object_root": reference_env.ycb_object_root.as_posix(),
         },

@@ -209,7 +209,7 @@ def create_single_object_ycb_scene(
     object_spec: YCBObjectSpec,
     scene_path: Optional[Union[str, Path]] = None,
 ) -> Path:
-    """Create or update a MuJoCo scene from the checked-in XML template."""
+    """Create a MuJoCo scene from the checked-in XML template if needed."""
     output_dir = _GENERATED_SCENE_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,7 +219,10 @@ def create_single_object_ycb_scene(
         scene_path = Path(scene_path)
         scene_path.parent.mkdir(parents=True, exist_ok=True)
 
-    template_path = scene_path if scene_path.exists() else _DEFAULT_SCENE_TEMPLATE
+    if scene_path.exists():
+        return scene_path
+
+    template_path = _DEFAULT_SCENE_TEMPLATE
     tree = ET.parse(template_path)
     root = tree.getroot()
 
@@ -308,7 +311,7 @@ def ensure_single_object_ycb_scene(
     scene_path: Optional[Union[str, Path]] = None,
     scale: float = 1.0,
 ) -> tuple[Path, YCBObjectSpec]:
-    """Create or refresh the single-object scene for the requested YCB object."""
+    """Create the single-object scene for the requested YCB object if missing."""
     object_spec = load_ycb_object_spec(object_root, scale=scale)
     xml_path = create_single_object_ycb_scene(object_spec, scene_path=scene_path)
     return xml_path, object_spec
