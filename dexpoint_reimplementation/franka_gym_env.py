@@ -23,6 +23,7 @@ from pointcloud_observation import (
 )
 from ycb_scene import (
     DEFAULT_YCB_OBJECT_ROOT,
+    YCB_ASSET_SOURCE_YCB_SIM,
     ensure_single_object_ycb_scene,
     load_ycb_object_spec,
 )
@@ -47,7 +48,8 @@ class FrankaGymEnvironment(gym.Env):
         frame_skip: int = 10,
         randomize_target_pose: bool = True,
         ycb_object_root: str = DEFAULT_YCB_OBJECT_ROOT.as_posix(),
-        target_scale: float = 0.9,
+        ycb_asset_source: str = YCB_ASSET_SOURCE_YCB_SIM,
+        target_scale: float = 1.0,
         target_body_name: str = "target_object",
         target_drop_height_range: Tuple[float, float] = (0.0, 0.03),
         goal_height_range: Tuple[float, float] = (0.1, 0.3),
@@ -70,6 +72,7 @@ class FrankaGymEnvironment(gym.Env):
             rate: Simulation frequency (Hz)
             randomize_target_pose: Whether to randomize can placement each episode
             ycb_object_root: Path to the YCB object directory to load into the scene
+            ycb_asset_source: Which YCB asset source to use ('ycb_sim' or 'raw')
             target_scale: Uniform scale applied to the target object's visual and collision geometry
             target_body_name: Body name used for the grasp target inside MuJoCo
             target_drop_height_range: Extra randomized drop height range above table
@@ -93,6 +96,7 @@ class FrankaGymEnvironment(gym.Env):
         self.robot_dof = 8
         self.joint_dim = self.robot_dof
         self.target_scale = float(target_scale)
+        self.ycb_asset_source = ycb_asset_source
         self.target_body_name = target_body_name
         self.target_drop_height_range = target_drop_height_range
         self.goal_height_range = goal_height_range
@@ -101,13 +105,16 @@ class FrankaGymEnvironment(gym.Env):
 
         self.ycb_object_root = Path(ycb_object_root).resolve()
         self.target_spec = load_ycb_object_spec(
-            self.ycb_object_root, scale=self.target_scale
+            self.ycb_object_root,
+            scale=self.target_scale,
+            source=self.ycb_asset_source,
         )
 
         if xml_path is None:
             scene_xml_path, _ = ensure_single_object_ycb_scene(
                 self.ycb_object_root,
                 scale=self.target_scale,
+                source=self.ycb_asset_source,
             )
             self.xml_path = scene_xml_path.as_posix()
         else:
@@ -136,9 +143,7 @@ class FrankaGymEnvironment(gym.Env):
             self.env.model
         )
         self.table_height = float(self.workspace_info["table_height"])
-        self.target_rest_height = self.table_height + float(
-            self.target_spec.half_extents[2]
-        )
+        self.target_rest_height = self.table_height + float(self.target_spec.rest_offset_z)
         self.success_lift_height = 0.08
 
         self.env.add_collision_exception(self.target_body_name)
@@ -239,7 +244,7 @@ class FrankaGymEnvironment(gym.Env):
                 self.target_drop_height_range[0], self.target_drop_height_range[1]
             )
         )
-        z = self.table_height + float(self.target_spec.half_extents[2]) + drop_height
+        z = self.table_height + float(self.target_spec.rest_offset_z) + drop_height
         yaw = float(self._rng.uniform(-math.pi, math.pi))
         quat = np.array(
             [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)], dtype=np.float64
