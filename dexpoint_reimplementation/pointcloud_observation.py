@@ -87,6 +87,9 @@ def collect_fused_pointcloud(
     min_y = workspace_bounds["min_y"]
     max_y = workspace_bounds["max_y"]
     min_z = table_height
+    min_allowed_z = min_z + min_height_above_table
+    max_allowed_z = min_z + max_height_above_table
+    hand_sphere_radius_sq = hand_sphere_radius * hand_sphere_radius
 
     hand_id = env.model.body(hand_body_name).id
     hand_pos = env.data.xpos[hand_id]
@@ -109,14 +112,14 @@ def collect_fused_pointcloud(
             & (points[:, 0] <= max_x)
             & (points[:, 1] >= min_y)
             & (points[:, 1] <= max_y)
-            & (points[:, 2] > (min_z + min_height_above_table))
-            & (points[:, 2] < (min_z + max_height_above_table))
+            & (points[:, 2] > min_allowed_z)
+            & (points[:, 2] < max_allowed_z)
         )
 
-        dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
-        hand_mask = dist_to_hand < hand_sphere_radius
-        mask = workspace_mask | hand_mask
-        filtered_points = points[mask]
+        hand_deltas = points - hand_pos
+        hand_mask = np.einsum("ij,ij->i", hand_deltas, hand_deltas) < hand_sphere_radius_sq
+        np.logical_or(workspace_mask, hand_mask, out=workspace_mask)
+        filtered_points = points[workspace_mask]
 
         if len(filtered_points) > 0:
             all_points.append(filtered_points)
@@ -124,7 +127,7 @@ def collect_fused_pointcloud(
     if not all_points:
         return np.zeros((0, 3), dtype=np.float32)
 
-    return np.vstack(all_points).astype(np.float32, copy=False)
+    return np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
 
 
 def collect_fused_pointcloud_for_training(
@@ -155,6 +158,9 @@ def collect_fused_pointcloud_for_training(
     min_y = workspace_bounds["min_y"]
     max_y = workspace_bounds["max_y"]
     min_z = table_height
+    min_allowed_z = min_z + min_height_above_table
+    max_allowed_z = min_z + max_height_above_table
+    hand_sphere_radius_sq = hand_sphere_radius * hand_sphere_radius
 
     hand_id = env.model.body(hand_body_name).id
     hand_pos = env.data.xpos[hand_id]
@@ -184,14 +190,14 @@ def collect_fused_pointcloud_for_training(
             & (points[:, 0] <= max_x)
             & (points[:, 1] >= min_y)
             & (points[:, 1] <= max_y)
-            & (points[:, 2] > (min_z + min_height_above_table))
-            & (points[:, 2] < (min_z + max_height_above_table))
+            & (points[:, 2] > min_allowed_z)
+            & (points[:, 2] < max_allowed_z)
         )
 
-        dist_to_hand = np.linalg.norm(points - hand_pos, axis=1)
-        hand_mask = dist_to_hand < hand_sphere_radius
-        mask = workspace_mask | hand_mask
-        filtered_points = points[mask]
+        hand_deltas = points - hand_pos
+        hand_mask = np.einsum("ij,ij->i", hand_deltas, hand_deltas) < hand_sphere_radius_sq
+        np.logical_or(workspace_mask, hand_mask, out=workspace_mask)
+        filtered_points = points[workspace_mask]
         if timing_stats is not None:
             timing_stats["collect_world_filter_s"] = timing_stats.get(
                 "collect_world_filter_s", 0.0
@@ -217,7 +223,7 @@ def collect_fused_pointcloud_for_training(
             )
         return np.zeros((0, 3), dtype=np.float32)
 
-    merged_points = np.vstack(all_points).astype(np.float32, copy=False)
+    merged_points = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
     if timing_stats is not None:
         timing_stats["collect_concat_s"] = timing_stats.get("collect_concat_s", 0.0) + (
             time.perf_counter() - concat_start
@@ -231,7 +237,7 @@ def collect_fused_pointcloud_for_training(
     return merged_points
 
 
-def center_and_sample_pointcloud(
+def sample_pointcloud(
     merged_points: np.ndarray,
     num_points: int,
     rng: Optional[np.random.Generator] = None,
@@ -239,20 +245,25 @@ def center_and_sample_pointcloud(
     if len(merged_points) == 0:
         return np.zeros((num_points, 3), dtype=np.float32)
 
-    pointcloud_mean = merged_points.mean(axis=0)
-    merged_points_centered = (merged_points - pointcloud_mean).astype(np.float32)
+    pointcloud = merged_points.astype(np.float32, copy=False)
 
     sampler = rng if rng is not None else np.random
-    if len(merged_points_centered) > num_points:
-        indices = sampler.choice(
-            len(merged_points_centered), size=num_points, replace=False
-        )
-        return merged_points_centered[indices]
+    if len(pointcloud) > num_points:
+        indices = sampler.choice(len(pointcloud), size=num_points, replace=False)
+        return pointcloud[indices]
 
-    pointcloud = merged_points_centered
     if len(pointcloud) < num_points:
         pad_size = num_points - len(pointcloud)
         padding = np.zeros((pad_size, 3), dtype=np.float32)
         pointcloud = np.vstack([pointcloud, padding])
 
     return pointcloud.astype(np.float32, copy=False)
+
+
+def center_and_sample_pointcloud(
+    merged_points: np.ndarray,
+    num_points: int,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    # just in case
+    return sample_pointcloud(merged_points, num_points, rng=rng)

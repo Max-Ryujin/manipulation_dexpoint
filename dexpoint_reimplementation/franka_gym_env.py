@@ -18,11 +18,11 @@ from gym import spaces
 from manipulation import FrankaEnvironment
 from manipulation.perception import MujocoCamera
 from pointcloud_observation import (
-    center_and_sample_pointcloud,
     collect_fused_pointcloud,
     collect_fused_pointcloud_for_training,
     get_workspace_configuration,
     POINTCLOUD_OVERSAMPLE_FACTOR,
+    sample_pointcloud,
 )
 from ycb_scene import (
     DEFAULT_YCB_OBJECT_ROOT,
@@ -148,6 +148,9 @@ class FrankaGymEnvironment(gym.Env):
         self.table_height = float(self.workspace_info["table_height"])
         self.target_rest_height = self.table_height + float(self.target_spec.rest_offset_z)
         self.success_lift_height = 0.08
+        self.failure_penalty = -1.0
+        self.failure_xy_margin = 0.05
+        self.failure_z_margin = 0.01
 
         self.env.add_collision_exception(self.target_body_name)
         self._sample_goal_position()
@@ -359,6 +362,41 @@ class FrankaGymEnvironment(gym.Env):
 
         return float(len(contacted_fingers) / 2.0)
 
+    def _check_failure_termination(self) -> Optional[Dict[str, Any]]:
+        target_pos = self.get_target_position()
+        xy_margin = float(
+            self.task_config.get("failure_xy_margin", self.failure_xy_margin)
+        )
+        z_margin = float(self.task_config.get("failure_z_margin", self.failure_z_margin))
+
+        min_x = self.workspace_bounds["min_x"] - xy_margin
+        max_x = self.workspace_bounds["max_x"] + xy_margin
+        min_y = self.workspace_bounds["min_y"] - xy_margin
+        max_y = self.workspace_bounds["max_y"] + xy_margin
+
+        target_below_table = bool(target_pos[2] < (self.table_height - z_margin))
+        target_out_of_workspace = bool(
+            target_pos[0] < min_x
+            or target_pos[0] > max_x
+            or target_pos[1] < min_y
+            or target_pos[1] > max_y
+        )
+
+        if not target_below_table and not target_out_of_workspace:
+            return None
+
+        episode_failure_reason = (
+            "target_below_table" if target_below_table else "target_out_of_workspace"
+        )
+        return {
+            "episode_failure_reason": episode_failure_reason,
+            "target_below_table": target_below_table,
+            "target_out_of_workspace": target_out_of_workspace,
+            "target_position_x": float(target_pos[0]),
+            "target_position_y": float(target_pos[1]),
+            "target_position_z": float(target_pos[2]),
+        }
+
     def step(
         self, action: np.ndarray
     ) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
@@ -446,6 +484,16 @@ class FrankaGymEnvironment(gym.Env):
         )
         info.update(action_metrics)
 
+        if not done:
+            failure_info = self._check_failure_termination()
+            if failure_info is not None:
+                reward = float(
+                    self.task_config.get("failure_penalty", self.failure_penalty)
+                )
+                done = True
+                info.update(failure_info)
+                info["failure_penalty"] = reward
+
         # Episode termination on max steps
         if self.step_count >= self.max_episode_steps:
             done = True
@@ -517,12 +565,12 @@ class FrankaGymEnvironment(gym.Env):
             self._last_valid_observation = fallback_obs
             return fallback_obs
 
-        center_sample_start = time.perf_counter()
-        pointcloud = center_and_sample_pointcloud(merged_points, self.num_points)
+        sample_start = time.perf_counter()
+        pointcloud = sample_pointcloud(merged_points, self.num_points)
         if timing_stats is not None:
-            timing_stats["obs_center_sample_s"] = timing_stats.get(
-                "obs_center_sample_s", 0.0
-            ) + (time.perf_counter() - center_sample_start)
+            timing_stats["obs_sample_s"] = timing_stats.get("obs_sample_s", 0.0) + (
+                time.perf_counter() - sample_start
+            )
         self._last_pointcloud_empty = False
 
         # Extract joint state (positions only)
@@ -583,7 +631,7 @@ class FrankaGymEnvironment(gym.Env):
             f"setup={avg_ms('camera_setup_s'):.1f}, depth_filter={avg_ms('camera_depth_filter_s'):.1f}, "
             f"sample={avg_ms('camera_sample_indices_s'):.1f}, unproject={avg_ms('camera_unproject_s'):.1f}, "
             f"world_filter={avg_ms('collect_world_filter_s'):.1f}, concat={avg_ms('collect_concat_s'):.1f}, "
-            f"center={avg_ms('obs_center_sample_s'):.1f}) "
+            f"obs_sample={avg_ms('obs_sample_s'):.1f}) "
             f"avg_counts(cameras={avg_count('camera_calls'):.1f}, pixels={avg_count('camera_pixels'):.0f}, "
             f"valid={avg_count('camera_valid_points'):.0f}, sampled={avg_count('camera_sampled_points'):.0f}, "
             f"filtered={avg_count('collect_points_after_filter'):.0f}, merged={avg_count('collect_merged_points'):.0f}, "
