@@ -3,6 +3,7 @@
 import contextlib
 import os
 import sys
+import time
 
 
 _VALIDATED_EGL_DEVICE_ID = None
@@ -201,7 +202,6 @@ class MujocoCamera:
         """
         width = width or self._width
         height = height or self._height
-
         model = self.env.get_model()
         camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
         if camera_id == -1:
@@ -443,12 +443,11 @@ class MujocoCamera:
         # 3. Define the coordinate correction matrix
         # Rotates "Vision" frame (Z-forward, Y-down) to "MuJoCo/OpenGL" frame (Z-backward, Y-up)
         # This is a 180-degree rotation around the X-axis.
-        R_correction = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
-
         # 4. Transform to World Frame
         # Formula: P_world = R_mujoco * (R_correction * P_vision) + t_mujoco
 
         # Combine rotations (more efficient than rotating points twice)
+        R_correction = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
         R_total = cam_rot @ R_correction
 
         # Apply transformation
@@ -469,6 +468,7 @@ class MujocoCamera:
         num_samples: int = 1000,
         min_depth: float = 0.3,
         max_depth: float = 3.0,
+        timing_stats: Optional[Dict[str, float]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Generate point cloud from depth only.
@@ -476,10 +476,16 @@ class MujocoCamera:
         This avoids the RGB render path when only xyz coordinates are needed,
         which is the common training-time case for DexPoint observations.
         """
+        render_start = time.perf_counter()
         depth = self.render_depth(camera_name, width, height)
+        if timing_stats is not None:
+            timing_stats["camera_render_depth_s"] = timing_stats.get(
+                "camera_render_depth_s", 0.0
+            ) + (time.perf_counter() - render_start)
 
         img_height, img_width = depth.shape
 
+        setup_start = time.perf_counter()
         fx, fy, cx, cy = self.get_camera_intrinsics(camera_name, img_width, img_height)
 
         u_coords, v_coords = np.meshgrid(
@@ -491,13 +497,29 @@ class MujocoCamera:
         u_flat = u_coords.ravel()
         v_flat = v_coords.ravel()
         depth_flat = depth.ravel()
+        if timing_stats is not None:
+            timing_stats["camera_setup_s"] = timing_stats.get(
+                "camera_setup_s", 0.0
+            ) + (time.perf_counter() - setup_start)
 
+        depth_filter_start = time.perf_counter()
         valid_mask = (
             (depth_flat >= min_depth)
             & (depth_flat <= max_depth)
             & np.isfinite(depth_flat)
         )
         valid_indices = np.where(valid_mask)[0]
+        if timing_stats is not None:
+            timing_stats["camera_depth_filter_s"] = timing_stats.get(
+                "camera_depth_filter_s", 0.0
+            ) + (time.perf_counter() - depth_filter_start)
+            timing_stats["camera_valid_points"] = timing_stats.get(
+                "camera_valid_points", 0.0
+            ) + float(len(valid_indices))
+            timing_stats["camera_pixels"] = timing_stats.get(
+                "camera_pixels", 0.0
+            ) + float(depth_flat.size)
+            timing_stats["camera_calls"] = timing_stats.get("camera_calls", 0.0) + 1.0
 
         if len(valid_indices) == 0:
             return (
@@ -506,13 +528,22 @@ class MujocoCamera:
                 np.zeros((0,), dtype=np.float32),
             )
 
+        sample_start = time.perf_counter()
         if len(valid_indices) > num_samples:
             sampled_indices = np.random.choice(
                 valid_indices, size=num_samples, replace=False
             )
         else:
             sampled_indices = valid_indices
+        if timing_stats is not None:
+            timing_stats["camera_sample_indices_s"] = timing_stats.get(
+                "camera_sample_indices_s", 0.0
+            ) + (time.perf_counter() - sample_start)
+            timing_stats["camera_sampled_points"] = timing_stats.get(
+                "camera_sampled_points", 0.0
+            ) + float(len(sampled_indices))
 
+        unproject_start = time.perf_counter()
         u_sampled = u_flat[sampled_indices]
         v_sampled = v_flat[sampled_indices]
         depth_sampled = depth_flat[sampled_indices]
@@ -527,6 +558,10 @@ class MujocoCamera:
         R_correction = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
         R_total = cam_rot @ R_correction
         points_world = (R_total @ points_cam.T).T + cam_pos
+        if timing_stats is not None:
+            timing_stats["camera_unproject_s"] = timing_stats.get(
+                "camera_unproject_s", 0.0
+            ) + (time.perf_counter() - unproject_start)
 
         return (
             points_world.astype(np.float32),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Iterable, Optional, Sequence
 
 import mujoco
@@ -142,8 +143,10 @@ def collect_fused_pointcloud_for_training(
     max_height_above_table: float = 0.2,
     min_height_above_table: float = 0.01,
     hand_sphere_radius: float = 0.12,
+    timing_stats: Optional[dict[str, float]] = None,
 ) -> np.ndarray:
     """Collect a fused point cloud for training using depth only."""
+    collection_start = time.perf_counter()
     all_points: list[np.ndarray] = []
     samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * num_points
 
@@ -157,6 +160,7 @@ def collect_fused_pointcloud_for_training(
     hand_pos = env.data.xpos[hand_id]
 
     for camera_name in camera_names:
+        camera_call_start = time.perf_counter()
         points, _pixels, _depths = camera.get_pointcloud_depth_only(
             camera_name,
             width=camera_width,
@@ -164,11 +168,17 @@ def collect_fused_pointcloud_for_training(
             num_samples=samples_per_camera,
             min_depth=min_depth,
             max_depth=max_depth,
+            timing_stats=timing_stats,
         )
+        if timing_stats is not None:
+            timing_stats["collect_camera_call_s"] = timing_stats.get(
+                "collect_camera_call_s", 0.0
+            ) + (time.perf_counter() - camera_call_start)
 
         if len(points) == 0:
             continue
 
+        filter_start = time.perf_counter()
         workspace_mask = (
             (points[:, 0] >= min_x)
             & (points[:, 0] <= max_x)
@@ -182,14 +192,43 @@ def collect_fused_pointcloud_for_training(
         hand_mask = dist_to_hand < hand_sphere_radius
         mask = workspace_mask | hand_mask
         filtered_points = points[mask]
+        if timing_stats is not None:
+            timing_stats["collect_world_filter_s"] = timing_stats.get(
+                "collect_world_filter_s", 0.0
+            ) + (time.perf_counter() - filter_start)
+            timing_stats["collect_points_after_filter"] = timing_stats.get(
+                "collect_points_after_filter", 0.0
+            ) + float(len(filtered_points))
 
         if len(filtered_points) > 0:
             all_points.append(filtered_points)
 
+    concat_start = time.perf_counter()
     if not all_points:
+        if timing_stats is not None:
+            timing_stats["collect_concat_s"] = timing_stats.get(
+                "collect_concat_s", 0.0
+            ) + (time.perf_counter() - concat_start)
+            timing_stats["collect_total_s"] = timing_stats.get(
+                "collect_total_s", 0.0
+            ) + (time.perf_counter() - collection_start)
+            timing_stats["collect_merged_points"] = timing_stats.get(
+                "collect_merged_points", 0.0
+            )
         return np.zeros((0, 3), dtype=np.float32)
 
-    return np.vstack(all_points).astype(np.float32, copy=False)
+    merged_points = np.vstack(all_points).astype(np.float32, copy=False)
+    if timing_stats is not None:
+        timing_stats["collect_concat_s"] = timing_stats.get("collect_concat_s", 0.0) + (
+            time.perf_counter() - concat_start
+        )
+        timing_stats["collect_total_s"] = timing_stats.get("collect_total_s", 0.0) + (
+            time.perf_counter() - collection_start
+        )
+        timing_stats["collect_merged_points"] = timing_stats.get(
+            "collect_merged_points", 0.0
+        ) + float(len(merged_points))
+    return merged_points
 
 
 def center_and_sample_pointcloud(

@@ -1,6 +1,9 @@
 """Gym Environment wrapper for Franka robot with point cloud observations."""
 
+from curses import flash
 import math
+import os
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -179,6 +182,9 @@ class FrankaGymEnvironment(gym.Env):
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
         self._last_pointcloud_size = 0
+        self.pointcloud_timing_log_interval = 1000
+        self._pointcloud_timing_totals: Dict[str, float] = {}
+        self._pointcloud_timing_count = 0
 
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
@@ -449,6 +455,11 @@ class FrankaGymEnvironment(gym.Env):
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Extract point cloud and proprioceptive observations from all cameras."""
+        timing_stats: Optional[Dict[str, float]] = None
+        observation_start = time.perf_counter()
+        if self.pointcloud_timing_log_interval > 0 and self.use_depth_only_pointcloud:
+            timing_stats = {}
+
         if self.use_depth_only_pointcloud:
             merged_points = collect_fused_pointcloud_for_training(
                 self.env,
@@ -459,6 +470,7 @@ class FrankaGymEnvironment(gym.Env):
                 camera_width=self.camera_width,
                 workspace_bounds=self.workspace_bounds,
                 table_height=self.table_height,
+                timing_stats=timing_stats,
             )
         else:
             merged_points = collect_fused_pointcloud(
@@ -493,10 +505,24 @@ class FrankaGymEnvironment(gym.Env):
                 "ee_position": ee_position,
                 "goal_position": self.goal_position.copy(),
             }
+            if timing_stats is not None:
+                timing_stats["obs_total_s"] = timing_stats.get("obs_total_s", 0.0) + (
+                    time.perf_counter() - observation_start
+                )
+                timing_stats["obs_pointcloud_size"] = timing_stats.get(
+                    "obs_pointcloud_size", 0.0
+                ) + float(len(merged_points))
+                timing_stats["obs_empty"] = timing_stats.get("obs_empty", 0.0) + 1.0
+                self._record_pointcloud_timing(timing_stats)
             self._last_valid_observation = fallback_obs
             return fallback_obs
 
+        center_sample_start = time.perf_counter()
         pointcloud = center_and_sample_pointcloud(merged_points, self.num_points)
+        if timing_stats is not None:
+            timing_stats["obs_center_sample_s"] = timing_stats.get(
+                "obs_center_sample_s", 0.0
+            ) + (time.perf_counter() - center_sample_start)
         self._last_pointcloud_empty = False
 
         # Extract joint state (positions only)
@@ -517,7 +543,52 @@ class FrankaGymEnvironment(gym.Env):
             "ee_position": ee_position.copy(),
             "goal_position": self.goal_position.copy(),
         }
+        if timing_stats is not None:
+            timing_stats["obs_total_s"] = timing_stats.get("obs_total_s", 0.0) + (
+                time.perf_counter() - observation_start
+            )
+            timing_stats["obs_pointcloud_size"] = timing_stats.get(
+                "obs_pointcloud_size", 0.0
+            ) + float(len(merged_points))
+            self._record_pointcloud_timing(timing_stats)
         return obs
+
+    def _record_pointcloud_timing(self, timing_stats: Dict[str, float]) -> None:
+        if self.pointcloud_timing_log_interval <= 0:
+            return
+
+        self._pointcloud_timing_count += 1
+        for key, value in timing_stats.items():
+            self._pointcloud_timing_totals[key] = (
+                self._pointcloud_timing_totals.get(key, 0.0) + value
+            )
+
+        if self._pointcloud_timing_count % self.pointcloud_timing_log_interval != 0:
+            return
+
+        count = float(self._pointcloud_timing_count)
+        totals = self._pointcloud_timing_totals
+
+        def avg_ms(key: str) -> float:
+            return 1000.0 * totals.get(key, 0.0) / count
+
+        def avg_count(key: str) -> float:
+            return totals.get(key, 0.0) / count
+
+        print(
+            "[PointcloudTiming] "
+            f"pid={os.getpid()} obs={self._pointcloud_timing_count} "
+            f"avg_ms(obs={avg_ms('obs_total_s'):.1f}, collect={avg_ms('collect_total_s'):.1f}, "
+            f"camera_call={avg_ms('collect_camera_call_s'):.1f}, render={avg_ms('camera_render_depth_s'):.1f}, "
+            f"setup={avg_ms('camera_setup_s'):.1f}, depth_filter={avg_ms('camera_depth_filter_s'):.1f}, "
+            f"sample={avg_ms('camera_sample_indices_s'):.1f}, unproject={avg_ms('camera_unproject_s'):.1f}, "
+            f"world_filter={avg_ms('collect_world_filter_s'):.1f}, concat={avg_ms('collect_concat_s'):.1f}, "
+            f"center={avg_ms('obs_center_sample_s'):.1f}) "
+            f"avg_counts(cameras={avg_count('camera_calls'):.1f}, pixels={avg_count('camera_pixels'):.0f}, "
+            f"valid={avg_count('camera_valid_points'):.0f}, sampled={avg_count('camera_sampled_points'):.0f}, "
+            f"filtered={avg_count('collect_points_after_filter'):.0f}, merged={avg_count('collect_merged_points'):.0f}, "
+            f"pointcloud={avg_count('obs_pointcloud_size'):.0f}, empty={avg_count('obs_empty'):.3f})", flush=True
+        )
 
     def _compute_reward_and_done(self) -> Tuple[float, bool, Dict[str, Any]]:
         """
