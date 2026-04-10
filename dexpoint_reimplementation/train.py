@@ -258,7 +258,7 @@ def train_dexpoint(
     if use_wandb:
         wandb.init(
             project=(
-                "dexpoint-franka-reaching"
+                "dexpoint-franka_reaching"
                 if task_name == "reaching"
                 else "dexpoint-franka"
             ),

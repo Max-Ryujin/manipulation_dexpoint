@@ -393,6 +393,12 @@ class FrankaGymEnvironment(gym.Env):
 
     def _check_failure_termination(self) -> Optional[Dict[str, Any]]:
         target_pos = self.get_target_position()
+        terminate_on_target_drop = bool(
+            self.task_config.get("terminate_on_target_drop", True)
+        )
+        terminate_on_target_escape = bool(
+            self.task_config.get("terminate_on_target_escape", True)
+        )
         xy_margin = float(
             self.task_config.get("failure_xy_margin", self.failure_xy_margin)
         )
@@ -405,8 +411,10 @@ class FrankaGymEnvironment(gym.Env):
         min_y = self.workspace_bounds["min_y"] - xy_margin
         max_y = self.workspace_bounds["max_y"] + xy_margin
 
-        target_below_table = bool(target_pos[2] < (self.table_height - z_margin))
-        target_out_of_workspace = bool(
+        target_below_table = terminate_on_target_drop and bool(
+            target_pos[2] < (self.table_height - z_margin)
+        )
+        target_out_of_workspace = terminate_on_target_escape and bool(
             target_pos[0] < min_x
             or target_pos[0] > max_x
             or target_pos[1] < min_y

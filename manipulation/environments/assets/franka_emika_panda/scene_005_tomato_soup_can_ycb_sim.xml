@@ -41,7 +41,9 @@
       <joint name="target_object_freejoint" type="free" />
       <inertial mass="0.349000" pos="0 0 0" diaginertia="0.00038585 0.00038585 0.00019003" />
       <geom name="target_object_visual" type="mesh" mesh="mesh_005_tomato_soup_can" pos="0.010000 -0.084000 -0.052000" material="material_005_tomato_soup_can" contype="0" conaffinity="0" />
-      <geom name="target_object_collision" type="cylinder" size="0.033000 0.050000" pos="0.000000 0.000000 0.000000" rgba="0 0 0 0" contype="2" conaffinity="1" condim="3" solimp="0.99 0.995 0.01" solref="0.01 1" friction="1 0.005 0.0001" />
+      <geom name="target_object_collision" type="cylinder" size="0.033000 0.050000" pos="0.000000 0.000000 0.000000" rgba="0.15 0.8 0.95 0.25" contype="2" conaffinity="1" condim="3" solimp="0.99 0.995 0.01" solref="0.01 1" friction="1 0.005 0.0001" />
+      <site name="target_center_site" pos="0 0 0" size="0.02" rgba="0.95 0.2 0.2 1" type="sphere" />
+      <site name="target_offset_site" pos="0 0 0.01" size="0.02" rgba="0.2 0.85 0.3 1" type="sphere" />
     </body>
   </worldbody>
 </mujoco>
