@@ -7,7 +7,7 @@ try:
 except ImportError:
     pass
 import numpy as np
-from typing import Optional, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from manipulation.core.base_env import BaseEnvironment
 from manipulation.ik.mink_ik import MinkIK
@@ -82,6 +82,7 @@ class FrankaEnvironment(BaseEnvironment):
         self.rate = RateLimiter(frequency=rate, warn=False)
         self.sim_time = 0.0
         self.viewer = None
+        self.viewer_marker_callback: Optional[Callable[[], List[dict]]] = None
 
     def get_model(self):
         return self.model
@@ -99,7 +100,42 @@ class FrankaEnvironment(BaseEnvironment):
         )
         mujoco.mjv_defaultFreeCamera(self.model, self.viewer.cam)
         mujoco.mj_forward(self.model, self.data)
+        self._update_viewer_markers()
+        self.viewer.sync()
         return self.viewer
+
+    def set_viewer_marker_callback(
+        self, callback: Optional[Callable[[], List[dict]]]
+    ) -> None:
+        self.viewer_marker_callback = callback
+        self._update_viewer_markers()
+
+    def _update_viewer_markers(self) -> None:
+        if self.viewer is None:
+            return
+
+        with self.viewer.lock():
+            self.viewer.user_scn.ngeom = 0
+            if self.viewer_marker_callback is None:
+                return
+
+            markers = self.viewer_marker_callback()
+            if not markers:
+                return
+
+            identity_mat = np.eye(3, dtype=np.float64).reshape(-1)
+            max_geoms = int(self.viewer.user_scn.maxgeom)
+            for marker in markers[:max_geoms]:
+                geom = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
+                mujoco.mjv_initGeom(
+                    geom,
+                    marker.get("type", mujoco.mjtGeom.mjGEOM_SPHERE),
+                    np.asarray(marker["size"], dtype=np.float64),
+                    np.asarray(marker["pos"], dtype=np.float64),
+                    identity_mat,
+                    np.asarray(marker["rgba"], dtype=np.float32),
+                )
+                self.viewer.user_scn.ngeom += 1
 
     def reset(self):
         self.data.ctrl[:] = self.initial_ctrl
@@ -108,6 +144,9 @@ class FrankaEnvironment(BaseEnvironment):
         self.ik.update_configuration(self.data.qpos)
         mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
+        if self.viewer is not None:
+            self._update_viewer_markers()
+            self.viewer.sync()
 
     def step(self):
         for _ in range(self.frame_skip):
@@ -115,6 +154,7 @@ class FrankaEnvironment(BaseEnvironment):
         dt = self.model.opt.timestep * self.frame_skip
         self.sim_time += dt
         if self.viewer is not None:
+            self._update_viewer_markers()
             self.viewer.sync()
         # self.rate.sleep()
         return dt

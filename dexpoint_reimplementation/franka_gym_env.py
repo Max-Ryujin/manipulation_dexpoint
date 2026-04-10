@@ -20,6 +20,8 @@ from manipulation.perception import MujocoCamera
 from pointcloud_observation import (
     collect_fused_pointcloud,
     collect_fused_pointcloud_for_training,
+    get_default_camera_names,
+    get_pointcloud_samples_per_camera,
     get_workspace_configuration,
     POINTCLOUD_OVERSAMPLE_FACTOR,
     sample_pointcloud,
@@ -125,14 +127,15 @@ class FrankaGymEnvironment(gym.Env):
 
         # Set default camera names if not provided
         if camera_names is None:
-            self.camera_names = ["top_camera", "side_camera", "front_camera"]
+            self.camera_names = get_default_camera_names()
         else:
-            self.camera_names = camera_names
+            self.camera_names = list(camera_names)
 
         # Initialize environment
         self.env = FrankaEnvironment(
             self.xml_path, rate=rate, frame_skip=self.frame_skip
         )
+        self.env.set_viewer_marker_callback(self._get_viewer_debug_markers)
         self.camera = MujocoCamera(self.env, width=camera_width, height=camera_height)
         self.hand_body_id = self.env.model.body("hand").id
         self.attachment_site_id = self.env.model.site("attachment_site").id
@@ -146,13 +149,14 @@ class FrankaGymEnvironment(gym.Env):
             self.env.model
         )
         self.table_height = float(self.workspace_info["table_height"])
-        self.target_rest_height = self.table_height + float(self.target_spec.rest_offset_z)
+        self.target_rest_height = self.table_height + float(
+            self.target_spec.rest_offset_z
+        )
         self.success_lift_height = 0.08
         self.failure_penalty = -1.0
         self.failure_xy_margin = 0.05
         self.failure_z_margin = 0.01
 
-        self.env.add_collision_exception(self.target_body_name)
         self._sample_goal_position()
 
         # Observation space: Dict with point cloud + joint state + ee_position + goal_position
@@ -179,7 +183,7 @@ class FrankaGymEnvironment(gym.Env):
 
         # Task-specific attributes
         self.task_config = {}
-        self.max_episode_steps = 800
+        self.max_episode_steps = 700
         self.step_count = 0
 
         self._last_valid_observation = self._create_empty_observation()
@@ -193,7 +197,6 @@ class FrankaGymEnvironment(gym.Env):
         """Reset environment and return initial observation."""
         self.env.reset()
         self.env.clear_collision_exceptions()
-        self.env.add_collision_exception(self.target_body_name)
 
         if self.randomize_target_pose:
             self._reset_target_pose()
@@ -282,6 +285,10 @@ class FrankaGymEnvironment(gym.Env):
             )
             return
 
+        if self.task_name == "reaching" and target_position is not None:
+            self.goal_position = np.asarray(target_position, dtype=np.float32).copy()
+            return
+
         bounds = self.workspace_bounds
         x = float(self._rng.uniform(bounds["min_x"], bounds["max_x"]))
         y = float(self._rng.uniform(bounds["min_y"], bounds["max_y"]))
@@ -291,7 +298,29 @@ class FrankaGymEnvironment(gym.Env):
         self.goal_position = np.array([x, y, z], dtype=np.float32)
 
     def get_target_position(self) -> np.ndarray:
-        return self.env.get_object_position(self.target_body_name)
+        return (
+            self.env.data.site_xpos[self.env.model.site("target_offset_site").id]
+            .copy()
+            .astype(np.float32)
+        )
+        # return self.env.get_object_position(self.target_body_name)
+
+    def _get_viewer_debug_markers(self) -> List[Dict[str, Any]]:
+        target_pos = self.get_target_position().astype(np.float64)
+        offset_target_pos = target_pos + np.array([0.0, 0.0, 0.01], dtype=np.float64)
+        marker_radius = 0.008
+        return [
+            {
+                "pos": target_pos,
+                "size": np.array([marker_radius, marker_radius, marker_radius]),
+                "rgba": np.array([0.95, 0.2, 0.2, 0.85]),
+            },
+            {
+                "pos": offset_target_pos,
+                "size": np.array([marker_radius, marker_radius, marker_radius]),
+                "rgba": np.array([0.2, 0.85, 0.3, 0.85]),
+            },
+        ]
 
     def get_target_pose(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.env.get_object_pose(self.target_body_name)
@@ -367,7 +396,9 @@ class FrankaGymEnvironment(gym.Env):
         xy_margin = float(
             self.task_config.get("failure_xy_margin", self.failure_xy_margin)
         )
-        z_margin = float(self.task_config.get("failure_z_margin", self.failure_z_margin))
+        z_margin = float(
+            self.task_config.get("failure_z_margin", self.failure_z_margin)
+        )
 
         min_x = self.workspace_bounds["min_x"] - xy_margin
         max_x = self.workspace_bounds["max_x"] + xy_margin
@@ -635,7 +666,8 @@ class FrankaGymEnvironment(gym.Env):
             f"avg_counts(cameras={avg_count('camera_calls'):.1f}, pixels={avg_count('camera_pixels'):.0f}, "
             f"valid={avg_count('camera_valid_points'):.0f}, sampled={avg_count('camera_sampled_points'):.0f}, "
             f"filtered={avg_count('collect_points_after_filter'):.0f}, merged={avg_count('collect_merged_points'):.0f}, "
-            f"pointcloud={avg_count('obs_pointcloud_size'):.0f}, empty={avg_count('obs_empty'):.3f})", flush=True
+            f"pointcloud={avg_count('obs_pointcloud_size'):.0f}, empty={avg_count('obs_empty'):.3f})",
+            flush=True,
         )
 
     def _compute_reward_and_done(self) -> Tuple[float, bool, Dict[str, Any]]:
@@ -667,7 +699,8 @@ class FrankaGymEnvironment(gym.Env):
                 - Other task-specific parameters
         """
         self.task_config = task_config
-        self.max_episode_steps = task_config.get("max_episode_steps", 500)
+        self.task_name = task_config.get("task_name", self.task_name)
+        self.max_episode_steps = task_config.get("max_episode_steps", 400)
         self.randomize_target_pose = task_config.get(
             "randomize_target_pose", self.randomize_target_pose
         )
@@ -722,7 +755,7 @@ class FrankaGymEnvironment(gym.Env):
             return self.render(mode=mode)
 
         if camera_name is None:
-            camera_name = self.camera_names[1]
+            camera_name = self.camera_names[0]
 
         try:
             # Get RGB image
@@ -737,7 +770,9 @@ class FrankaGymEnvironment(gym.Env):
 
             # Get point cloud for this camera
             # Use only the points from this specific camera to avoid confusion
-            samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * self.num_points
+            samples_per_camera = get_pointcloud_samples_per_camera(
+                self.num_points, [camera_name]
+            )
             points, colors, pixels, depths = self.camera.get_pointcloud(
                 camera_name,
                 width=self.camera_width,

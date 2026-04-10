@@ -9,12 +9,23 @@ import mujoco
 import numpy as np
 
 
-DEFAULT_CAMERA_NAMES = ("top_camera", "side_camera", "front_camera")
+DEFAULT_CAMERA_NAMES = ("side_camera",)
+_BASELINE_CAMERA_COUNT = 3
 POINTCLOUD_OVERSAMPLE_FACTOR = 40
 
 
 def get_default_camera_names() -> list[str]:
     return list(DEFAULT_CAMERA_NAMES)
+
+
+def get_pointcloud_samples_per_camera(
+    num_points: int, camera_names: Optional[Sequence[str]] = None
+) -> int:
+    active_camera_count = max(1, len(camera_names or DEFAULT_CAMERA_NAMES))
+    camera_multiplier = max(
+        1, (_BASELINE_CAMERA_COUNT + active_camera_count - 1) // active_camera_count
+    )
+    return POINTCLOUD_OVERSAMPLE_FACTOR * camera_multiplier * num_points
 
 
 def get_workspace_configuration(
@@ -80,7 +91,7 @@ def collect_fused_pointcloud(
     hand_sphere_radius: float = 0.12,
 ) -> np.ndarray:
     all_points: list[np.ndarray] = []
-    samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * num_points
+    samples_per_camera = get_pointcloud_samples_per_camera(num_points, camera_names)
 
     min_x = workspace_bounds["min_x"]
     max_x = workspace_bounds["max_x"]
@@ -151,7 +162,7 @@ def collect_fused_pointcloud_for_training(
     """Collect a fused point cloud for training using depth only."""
     collection_start = time.perf_counter()
     all_points: list[np.ndarray] = []
-    samples_per_camera = POINTCLOUD_OVERSAMPLE_FACTOR * num_points
+    samples_per_camera = get_pointcloud_samples_per_camera(num_points, camera_names)
 
     min_x = workspace_bounds["min_x"]
     max_x = workspace_bounds["max_x"]

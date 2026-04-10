@@ -162,7 +162,6 @@ def create_configured_environment(
     )
     task_config = create_task_config(
         task_name,
-        max_episode_steps=800,
         target_body_name=env.target_body_name,
     )
     env.configure_task(task_config)
@@ -206,7 +205,7 @@ def train_dexpoint(
     total_timesteps: int = 100000,
     learning_rate: float = 3e-4,
     batch_size: int = 64,
-    n_epochs: int = 8,
+    n_epochs: int = 6,
     n_steps: int = 2400,
     save_interval: int = 100000,
     verbose: int = 1,
@@ -258,7 +257,11 @@ def train_dexpoint(
 
     if use_wandb:
         wandb.init(
-            project="dexpoint-franka",
+            project=(
+                "dexpoint-franka-reaching"
+                if task_name == "reaching"
+                else "dexpoint-franka"
+            ),
             name=resolved_wandb_run_name,
             config={
                 "task": task_name,
@@ -424,7 +427,7 @@ def train_dexpoint(
         "pointnet_variant": resolved_pointnet_variant,
         "env_config": {
             "num_points": 512,
-            "camera_names": ["top_camera", "side_camera", "front_camera"],
+            "camera_names": reference_env.camera_names,
             "use_depth_only_pointcloud": True,
             "training_camera_height": TRAIN_CAMERA_HEIGHT,
             "training_camera_width": TRAIN_CAMERA_WIDTH,
@@ -611,7 +614,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping"],
+        choices=["grasping", "reaching"],
         help="Task to train on",
     )
     parser.add_argument(

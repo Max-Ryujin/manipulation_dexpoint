@@ -81,17 +81,22 @@ class Phase:
     dwell_steps: int = 0
 
 
-def build_environment(seed: Optional[int]) -> FrankaGymEnvironment:
+def build_environment(
+    seed: Optional[int],
+    camera_height: int = 240,
+    camera_width: int = 320,
+    overlay_pointcloud: bool = False,
+) -> FrankaGymEnvironment:
     env = FrankaGymEnvironment(
         xml_path=None,
         task_name=GraspingTask.NAME,
         ycb_object_root=DEFAULT_YCB_OBJECT_ROOT.as_posix(),
         num_points=512,
-        camera_height=480,
-        camera_width=640,
+        camera_height=camera_height,
+        camera_width=camera_width,
         rate=200.0,
         frame_skip=10,
-        visualize_pointclouds=True,
+        visualize_pointclouds=overlay_pointcloud,
     )
     env.configure_task(
         create_task_config(
@@ -254,28 +259,33 @@ def build_row(
 
 def collect_env_step(env: FrankaGymEnvironment) -> Tuple[float, bool, Dict[str, Any]]:
     env.step_count += 1
-    env._get_observation()
-
-    if env._last_pointcloud_empty:
-        info = {
-            "pointcloud_empty": True,
-            "pointcloud_size": env._last_pointcloud_size,
-            "contact_count": int(env.env.data.ncon),
-            "max_joint_speed": float(np.max(np.abs(env.env.data.qvel[: env.robot_dof]))),
-            "episode_failure_reason": "empty_pointcloud",
-        }
-        return 0.0, True, info
-
     reward, done, info = env._compute_reward_and_done()
     info = dict(info)
     info.setdefault("pointcloud_empty", False)
-    info["pointcloud_size"] = env._last_pointcloud_size
+    info.setdefault("pointcloud_size", 0)
     info["contact_count"] = int(env.env.data.ncon)
     info["max_joint_speed"] = float(np.max(np.abs(env.env.data.qvel[: env.robot_dof])))
+
+    if not done:
+        failure_info = env._check_failure_termination()
+        if failure_info is not None:
+            reward = float(env.task_config.get("failure_penalty", env.failure_penalty))
+            done = True
+            info.update(failure_info)
+            info["failure_penalty"] = reward
+
     if env.step_count >= env.max_episode_steps:
         done = True
         info["step_limit_reached"] = True
     return float(reward), bool(done), info
+
+
+def render_debug_frame(
+    env: FrankaGymEnvironment, overlay_pointcloud: bool = False
+) -> Optional[np.ndarray]:
+    if overlay_pointcloud:
+        return env.render_with_pointcloud(mode="rgb_array")
+    return env.render(mode="rgb_array")
 
 
 def command_motion_phase(
@@ -344,7 +354,9 @@ def run_episode(
 ) -> Dict[str, Any]:
     env.reset()
     if video_writer is not None:
-        video_writer.append_data(env.render_with_pointcloud(mode="rgb_array"))
+        frame = render_debug_frame(env, overlay_pointcloud=args.overlay_pointcloud)
+        if frame is not None:
+            video_writer.append_data(frame)
     phases = build_phase_sequence(env, args)
     phase_index = 0
     phase = phases[phase_index]
@@ -373,7 +385,9 @@ def run_episode(
         env.env.step()
         reward, done, info = collect_env_step(env)
         if video_writer is not None:
-            video_writer.append_data(env.render_with_pointcloud(mode="rgb_array"))
+            frame = render_debug_frame(env, overlay_pointcloud=args.overlay_pointcloud)
+            if frame is not None:
+                video_writer.append_data(frame)
         last_reward = reward
         last_info = info
 
@@ -388,6 +402,12 @@ def run_episode(
         csv_writer.writerow(row)
 
         elapsed = env.step_count - phase_started_step
+        if phase.kind == "motion" and elapsed > 0 and elapsed % 10 == 0:
+            print(
+                f"[episode {episode_index}] {phase.name} progress "
+                f"step={elapsed}/{phase.timeout_steps} "
+                f"remaining_waypoints={len(env.env.controller.trajectory)}"
+            )
         if elapsed > phase.timeout_steps:
             info["phase_timeout"] = True
             info["timed_out_phase"] = phase.name
@@ -451,6 +471,23 @@ def parse_args() -> argparse.Namespace:
         help="Frames per second for the saved rollout video",
     )
     parser.add_argument(
+        "--camera-width",
+        type=int,
+        default=320,
+        help="Camera render width for saved debug video frames",
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=240,
+        help="Camera render height for saved debug video frames",
+    )
+    parser.add_argument(
+        "--overlay-pointcloud",
+        action="store_true",
+        help="Overlay the sampled point cloud on saved video frames. Disabled by default because it makes scripted debugging much slower.",
+    )
+    parser.add_argument(
         "--approach-height",
         type=float,
         default=0.12,
@@ -495,7 +532,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arm-step-size",
         type=float,
-        default=0.02,
+        default=0.1,
         help="Joint interpolation step size passed to the position controller",
     )
     return parser.parse_args()
@@ -509,7 +546,12 @@ def main() -> None:
     csv_path = run_dir / "handcrafted_grasp_log.csv"
     video_path = run_dir / args.video_name
 
-    env = build_environment(args.seed)
+    env = build_environment(
+        args.seed,
+        camera_height=args.camera_height,
+        camera_width=args.camera_width,
+        overlay_pointcloud=args.overlay_pointcloud,
+    )
 
     print(f"Logging to {csv_path}")
     print(f"Saving video to {video_path}")
