@@ -5,12 +5,233 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+class ReachingTask:
+    """End-effector reaching task configuration."""
+
+    NAME = "reaching"
+    TARGET_OBJECT = "target_object"
+    MAX_EPISODE_STEPS = 150
+    MIDPOINT_DISTANCE_REWARD_SCALE = 1.5
+    EE_DISTANCE_REWARD_SCALE = 0.15
+    EE_DISTANCE_SCALE = 0.20
+    FINGER_DISTANCE_REWARD_SCALE = 1.0
+    FINGER_DISTANCE_SCALE = 0.04
+    FINGER_STANDOFF_MARGIN = 0.01
+    FINGER_BALANCE_REWARD_SCALE = 0.35
+    FINGER_BALANCE_SCALE = 0.05
+    OPEN_REWARD_SCALE = 0.75
+    SUCCESS_DISTANCE_THRESHOLD = 0.025
+    SUCCESS_FINGER_DISTANCE_THRESHOLD = 0.06
+    SUCCESS_OPEN_FRACTION_THRESHOLD = 0.6
+    SUCCESS_BONUS = 2.0
+    TIME_PENALTY = 1e-3
+
+    @staticmethod
+    def get_default_config() -> Dict[str, Any]:
+        return {
+            "max_episode_steps": ReachingTask.MAX_EPISODE_STEPS,
+            "randomize_target_pose": True,
+            "reward_fn": ReachingTask.reward_function,
+            "reward_variant": "default",
+            "task_name": ReachingTask.NAME,
+            "target_body_name": ReachingTask.TARGET_OBJECT,
+            "midpoint_distance_reward_scale": ReachingTask.MIDPOINT_DISTANCE_REWARD_SCALE,
+            "ee_distance_reward_scale": ReachingTask.EE_DISTANCE_REWARD_SCALE,
+            "ee_distance_scale": ReachingTask.EE_DISTANCE_SCALE,
+            "finger_distance_reward_scale": ReachingTask.FINGER_DISTANCE_REWARD_SCALE,
+            "finger_distance_scale": ReachingTask.FINGER_DISTANCE_SCALE,
+            "finger_standoff_margin": ReachingTask.FINGER_STANDOFF_MARGIN,
+            "finger_balance_reward_scale": ReachingTask.FINGER_BALANCE_REWARD_SCALE,
+            "finger_balance_scale": ReachingTask.FINGER_BALANCE_SCALE,
+            "open_reward_scale": ReachingTask.OPEN_REWARD_SCALE,
+            "success_distance_threshold": ReachingTask.SUCCESS_DISTANCE_THRESHOLD,
+            "success_finger_distance_threshold": ReachingTask.SUCCESS_FINGER_DISTANCE_THRESHOLD,
+            "success_open_fraction_threshold": ReachingTask.SUCCESS_OPEN_FRACTION_THRESHOLD,
+            "success_bonus": ReachingTask.SUCCESS_BONUS,
+            "time_penalty": ReachingTask.TIME_PENALTY,
+            "terminate_on_target_escape": False,
+        }
+
+    @staticmethod
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        info = {"task": ReachingTask.NAME, "step": env.step_count}
+
+        target_pos = env.get_target_position()
+        ee_pos = env.get_end_effector_position()
+        left_finger_pos = env.get_left_finger_position()
+        right_finger_pos = env.get_right_finger_position()
+        finger_midpoint = env.get_finger_midpoint_position()
+
+        ee_distance = float(np.linalg.norm(target_pos - ee_pos))
+        midpoint_distance = float(np.linalg.norm(target_pos - finger_midpoint))
+        left_finger_distance = float(np.linalg.norm(target_pos - left_finger_pos))
+        right_finger_distance = float(np.linalg.norm(target_pos - right_finger_pos))
+        finger_distance = 0.5 * (left_finger_distance + right_finger_distance)
+        finger_balance = float(abs(left_finger_distance - right_finger_distance))
+        gripper_open_fraction = env.get_gripper_open_fraction()
+        target_radius = float(np.max(env.target_spec.half_extents[:2]))
+        finger_standoff_margin = float(
+            env.task_config.get(
+                "finger_standoff_margin", ReachingTask.FINGER_STANDOFF_MARGIN
+            )
+        )
+        desired_finger_distance = max(target_radius + finger_standoff_margin, 1e-6)
+        left_finger_distance_error = float(
+            abs(left_finger_distance - desired_finger_distance)
+        )
+        right_finger_distance_error = float(
+            abs(right_finger_distance - desired_finger_distance)
+        )
+        finger_distance_error = 0.5 * (
+            left_finger_distance_error + right_finger_distance_error
+        )
+
+        midpoint_distance_scale = float(
+            env.task_config.get(
+                "midpoint_distance_scale",
+                env.task_config.get(
+                    "ee_distance_scale", ReachingTask.EE_DISTANCE_SCALE
+                ),
+            )
+        )
+        ee_distance_scale = float(
+            env.task_config.get("ee_distance_scale", ReachingTask.EE_DISTANCE_SCALE)
+        )
+        finger_distance_scale = float(
+            env.task_config.get(
+                "finger_distance_scale", ReachingTask.FINGER_DISTANCE_SCALE
+            )
+        )
+        finger_balance_scale = float(
+            env.task_config.get(
+                "finger_balance_scale", ReachingTask.FINGER_BALANCE_SCALE
+            )
+        )
+        midpoint_distance_reward_scale = float(
+            env.task_config.get(
+                "midpoint_distance_reward_scale",
+                ReachingTask.MIDPOINT_DISTANCE_REWARD_SCALE,
+            )
+        )
+        ee_distance_reward_scale = float(
+            env.task_config.get(
+                "ee_distance_reward_scale",
+                ReachingTask.EE_DISTANCE_REWARD_SCALE,
+            )
+        )
+        finger_distance_reward_scale = float(
+            env.task_config.get(
+                "finger_distance_reward_scale",
+                ReachingTask.FINGER_DISTANCE_REWARD_SCALE,
+            )
+        )
+        finger_balance_reward_scale = float(
+            env.task_config.get(
+                "finger_balance_reward_scale",
+                ReachingTask.FINGER_BALANCE_REWARD_SCALE,
+            )
+        )
+        open_reward_scale = float(
+            env.task_config.get("open_reward_scale", ReachingTask.OPEN_REWARD_SCALE)
+        )
+        success_distance_threshold = float(
+            env.task_config.get(
+                "success_distance_threshold",
+                ReachingTask.SUCCESS_DISTANCE_THRESHOLD,
+            )
+        )
+        success_finger_distance_threshold = float(
+            env.task_config.get(
+                "success_finger_distance_threshold",
+                ReachingTask.SUCCESS_FINGER_DISTANCE_THRESHOLD,
+            )
+        )
+        success_open_fraction_threshold = float(
+            env.task_config.get(
+                "success_open_fraction_threshold",
+                ReachingTask.SUCCESS_OPEN_FRACTION_THRESHOLD,
+            )
+        )
+        success_bonus = float(
+            env.task_config.get("success_bonus", ReachingTask.SUCCESS_BONUS)
+        )
+        time_penalty = -float(
+            env.task_config.get("time_penalty", ReachingTask.TIME_PENALTY)
+        )
+
+        midpoint_distance_score = 1.0 - np.tanh(
+            midpoint_distance / max(midpoint_distance_scale, 1e-6)
+        )
+        ee_distance_score = 1.0 - np.tanh(ee_distance / max(ee_distance_scale, 1e-6))
+        finger_distance_score = 1.0 - np.tanh(
+            finger_distance_error / max(finger_distance_scale, 1e-6)
+        )
+        finger_balance_score = 1.0 - np.tanh(
+            finger_balance / max(finger_balance_scale, 1e-6)
+        )
+        proximity_score = 0.5 * (
+            float(midpoint_distance_score) + float(finger_distance_score)
+        )
+        open_reward_weight = open_reward_scale * (0.25 + 0.75 * proximity_score)
+        open_reward = open_reward_weight * float(gripper_open_fraction)
+        finger_balance_reward = (
+            finger_balance_reward_scale
+            * float(finger_balance_score)
+            * float(midpoint_distance_score)
+        )
+
+        reward = (
+            midpoint_distance_reward_scale * float(midpoint_distance_score)
+            + finger_distance_reward_scale * float(finger_distance_score)
+            + ee_distance_reward_scale * float(ee_distance_score)
+            + float(finger_balance_reward)
+            + float(open_reward)
+            + time_penalty
+        )
+        is_success = bool(
+            midpoint_distance <= success_distance_threshold
+            and finger_distance <= success_finger_distance_threshold
+            and gripper_open_fraction >= success_open_fraction_threshold
+        )
+        if is_success:
+            reward += success_bonus
+
+        info.update(
+            {
+                "ee_distance": ee_distance,
+                "midpoint_distance": midpoint_distance,
+                "left_finger_distance": left_finger_distance,
+                "right_finger_distance": right_finger_distance,
+                "finger_distance": float(finger_distance),
+                "desired_finger_distance": float(desired_finger_distance),
+                "left_finger_distance_error": float(left_finger_distance_error),
+                "right_finger_distance_error": float(right_finger_distance_error),
+                "finger_distance_error": float(finger_distance_error),
+                "finger_balance": float(finger_balance),
+                "gripper_open_fraction": float(gripper_open_fraction),
+                "open_reward_weight": float(open_reward_weight),
+                "midpoint_distance_score": float(midpoint_distance_score),
+                "ee_distance_score": float(ee_distance_score),
+                "finger_distance_score": float(finger_distance_score),
+                "finger_balance_score": float(finger_balance_score),
+                "finger_balance_reward": float(finger_balance_reward),
+                "open_reward": float(open_reward),
+                "time_penalty": time_penalty,
+                "success_bonus": success_bonus if is_success else 0.0,
+                "is_success": is_success,
+                "reward_total": float(reward),
+            }
+        )
+
+        return float(reward), is_success, info
+
+
 class GraspingTask:
     """Object grasping task configuration."""
 
     NAME = "grasping"
     TARGET_OBJECT = "target_object"
-    DISTANCE_REWARD_SCALE = 0.75    
+    DISTANCE_REWARD_SCALE = 0.75
     DISTANCE_SCALE = 0.25
     ORIENTATION_REWARD_SCALE = 0.2
     ORIENTATION_THRESHOLD = 0.90
@@ -691,14 +912,23 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
     """
     if task_name == "grasping":
         config = GraspingTask.get_default_config()
+    elif task_name == "reaching":
+        config = ReachingTask.get_default_config()
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
-    reward_variant = kwargs.pop("reward_variant", config.get("reward_variant", "shaped"))
-    if reward_variant == "legacy":
-        config["reward_fn"] = GraspingTask.reward_function
-    elif reward_variant == "shaped":
-        config["reward_fn"] = GraspingTask.reward_function_shaped
+    reward_variant = kwargs.pop(
+        "reward_variant", config.get("reward_variant", "default")
+    )
+    if task_name == "grasping":
+        if reward_variant == "legacy":
+            config["reward_fn"] = GraspingTask.reward_function
+        elif reward_variant == "shaped":
+            config["reward_fn"] = GraspingTask.reward_function_shaped
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif reward_variant in {"default", "reaching"}:
+        config["reward_fn"] = ReachingTask.reward_function
     else:
         raise ValueError(f"Unknown reward variant: {reward_variant}")
     config["reward_variant"] = reward_variant
