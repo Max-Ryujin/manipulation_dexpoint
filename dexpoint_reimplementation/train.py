@@ -36,6 +36,7 @@ else:
         MultiInputActorCriticPolicy,
     )
 from dexart_baselines.stable_baselines3.common.vec_env import SubprocVecEnv
+from dexart_baselines.stable_baselines3.common.save_util import load_from_zip_file
 from dexpoint_policy import DexPointPolicy
 
 # from dexart_baselines.stable_baselines3.common.policies import MlpPolicy
@@ -121,6 +122,24 @@ def get_default_pointnet_checkpoint() -> Optional[str]:
     if _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.exists():
         return _DEFAULT_SIMSIAM_POINTNET_CHECKPOINT.as_posix()
     return None
+
+
+def get_pretrained_policy_kwargs(
+    checkpoint_path: str,
+    *,
+    freeze_pointnet: bool = False,
+) -> dict:
+    """Load policy kwargs from a saved RL checkpoint for safe restoration."""
+    data, _, _ = load_from_zip_file(str(checkpoint_path), device="cpu")
+    policy_kwargs = dict(data.get("policy_kwargs", {}))
+
+    # Full policy checkpoints already contain PointNet weights, so do not require
+    # the original external encoder checkpoint to be present during restore.
+    policy_kwargs["pointnet_checkpoint_path"] = None
+    if freeze_pointnet:
+        policy_kwargs["freeze_pointnet"] = True
+
+    return policy_kwargs
 
 
 def create_output_dir():
@@ -213,6 +232,7 @@ def train_dexpoint(
     record_video: bool = True,
     video_interval: int = 100000,
     pointnet_checkpoint_path: Optional[str] = None,
+    pretrained_model_checkpoint_path: Optional[str] = None,
     pointnet_variant: str = "auto",
     freeze_pointnet: bool = False,
     wandb_run_name: Optional[str] = None,
@@ -235,6 +255,7 @@ def train_dexpoint(
         record_video: Record training videos
         video_interval: Record video every N timesteps
         pointnet_checkpoint_path: Optional PointNet encoder checkpoint
+        pretrained_model_checkpoint_path: Optional RL checkpoint to continue training from
         pointnet_variant: PointNet architecture variant or "auto" to infer it
         freeze_pointnet: Whether to keep PointNet frozen during RL training
         wandb_run_name: Optional explicit Weights & Biases run name
@@ -246,10 +267,25 @@ def train_dexpoint(
     resolved_wandb_run_name = wandb_run_name or (
         f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
+    pretrained_policy_kwargs = None
+    if pretrained_model_checkpoint_path is not None:
+        pretrained_policy_kwargs = get_pretrained_policy_kwargs(
+            pretrained_model_checkpoint_path,
+            freeze_pointnet=freeze_pointnet,
+        )
     resolved_pointnet_variant = (
-        infer_pointnet_variant(pointnet_checkpoint_path)
-        if pointnet_variant == "auto"
-        else pointnet_variant
+        str(pretrained_policy_kwargs.get("pointnet_variant", "unknown"))
+        if pretrained_policy_kwargs is not None
+        else (
+            infer_pointnet_variant(pointnet_checkpoint_path)
+            if pointnet_variant == "auto"
+            else pointnet_variant
+        )
+    )
+    initialization_mode = (
+        "pretrained_model"
+        if pretrained_model_checkpoint_path is not None
+        else "pointnet_only"
     )
 
     if num_envs < 1:
@@ -275,8 +311,10 @@ def train_dexpoint(
                 "video_interval": video_interval,
                 "pointcloud_points": 512,
                 "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                "pretrained_model_checkpoint_path": pretrained_model_checkpoint_path,
                 "pointnet_variant": resolved_pointnet_variant,
                 "freeze_pointnet": freeze_pointnet,
+                "initialization_mode": initialization_mode,
                 "wandb_run_name": resolved_wandb_run_name,
             },
         )
@@ -326,6 +364,11 @@ def train_dexpoint(
     print(f"  - Agent: {agent_name.upper()}")
     print(f"  - Parallel envs: {num_envs}")
     print(f"  - PointNet variant: {resolved_pointnet_variant}")
+    print(f"  - Initialization mode: {initialization_mode}")
+    if pretrained_model_checkpoint_path is not None:
+        print(f"  - Pretrained RL checkpoint: {pretrained_model_checkpoint_path}")
+    elif pointnet_checkpoint_path is not None:
+        print(f"  - Pretrained PointNet checkpoint: {pointnet_checkpoint_path}")
     print(f"  - Observation space: {env.observation_space}")
     print(f"  - Action space: {env.action_space}")
 
@@ -335,58 +378,85 @@ def train_dexpoint(
     agent = None
 
     if agent_name == "ppo":
-        agent = PPO(
-            policy=DexPointPolicy,
-            env=env,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            n_epochs=n_epochs,
-            gamma=0.992,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            clip_range_vf=None,
-            ent_coef=0.0,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            use_sde=False,
-            sde_sample_freq=-1,
-            target_kl=None,
-            create_eval_env=False,
-            policy_kwargs={
-                # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
-                "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                "pointnet_variant": resolved_pointnet_variant,
-                "pointnet_checkpoint_path": pointnet_checkpoint_path,
-                "freeze_pointnet": freeze_pointnet,
-            },
-            verbose=verbose,
-            wandb_project="dexpoint-franka" if use_wandb else None,
-            wandb_run_name=resolved_wandb_run_name if use_wandb else None,
-        )
-        print(f"|PPO agent created")
+        if pretrained_model_checkpoint_path is not None:
+            agent = PPO.load(
+                pretrained_model_checkpoint_path,
+                env=env,
+                device="auto",
+                custom_objects={"policy_kwargs": pretrained_policy_kwargs},
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                verbose=verbose,
+                wandb_project="dexpoint-franka" if use_wandb else None,
+                wandb_run_name=resolved_wandb_run_name if use_wandb else None,
+            )
+            print(f"|Loaded PPO agent from {pretrained_model_checkpoint_path}")
+        else:
+            agent = PPO(
+                policy=DexPointPolicy,
+                env=env,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                gamma=0.992,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                clip_range_vf=None,
+                ent_coef=0.0,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                use_sde=False,
+                sde_sample_freq=-1,
+                target_kl=None,
+                create_eval_env=False,
+                policy_kwargs={
+                    "net_arch": [dict(pi=[128, 128], vf=[128, 128])],
+                    "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+                    "pointnet_variant": resolved_pointnet_variant,
+                    "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                    "freeze_pointnet": freeze_pointnet,
+                },
+                verbose=verbose,
+                wandb_project="dexpoint-franka" if use_wandb else None,
+                wandb_run_name=resolved_wandb_run_name if use_wandb else None,
+            )
+            print(f"|PPO agent created")
     elif agent_name == "a2c":
-        agent = A2C(
-            policy=DexPointPolicy,
-            env=env,
-            learning_rate=learning_rate,
-            n_steps=n_steps // 2,  # A2C typically uses shorter rollouts
-            gamma=0.992,
-            gae_lambda=0.95,
-            max_grad_norm=0.5,
-            use_sde=False,
-            sde_sample_freq=-1,
-            create_eval_env=False,
-            policy_kwargs={
-                # "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
-                "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                "pointnet_variant": resolved_pointnet_variant,
-                "pointnet_checkpoint_path": pointnet_checkpoint_path,
-                "freeze_pointnet": freeze_pointnet,
-            },
-            verbose=verbose,
-        )
-        print(f"|A2C agent created")
+        if pretrained_model_checkpoint_path is not None:
+            agent = A2C.load(
+                pretrained_model_checkpoint_path,
+                env=env,
+                device="auto",
+                custom_objects={"policy_kwargs": pretrained_policy_kwargs},
+                learning_rate=learning_rate,
+                n_steps=n_steps // 2,
+                verbose=verbose,
+            )
+            print(f"|Loaded A2C agent from {pretrained_model_checkpoint_path}")
+        else:
+            agent = A2C(
+                policy=DexPointPolicy,
+                env=env,
+                learning_rate=learning_rate,
+                n_steps=n_steps // 2,  # A2C typically uses shorter rollouts
+                gamma=0.992,
+                gae_lambda=0.95,
+                max_grad_norm=0.5,
+                use_sde=False,
+                sde_sample_freq=-1,
+                create_eval_env=False,
+                policy_kwargs={
+                    "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+                    "pointnet_variant": resolved_pointnet_variant,
+                    "pointnet_checkpoint_path": pointnet_checkpoint_path,
+                    "freeze_pointnet": freeze_pointnet,
+                },
+                verbose=verbose,
+            )
+            print(f"|A2C agent created")
 
     if agent is None:
         print(f"Unsupported agent: {agent_name}")
@@ -424,6 +494,8 @@ def train_dexpoint(
         "record_video": record_video,
         "video_interval": video_interval,
         "wandb_run_name": resolved_wandb_run_name if use_wandb else None,
+        "initialization_mode": initialization_mode,
+        "pretrained_model_checkpoint_path": pretrained_model_checkpoint_path,
         "pointnet_variant": resolved_pointnet_variant,
         "env_config": {
             "num_points": 512,
@@ -673,6 +745,15 @@ def main():
         help="Path to a pretrained PointNet encoder checkpoint.",
     )
     parser.add_argument(
+        "--pretrained-model-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pretrained RL checkpoint (.zip) to continue training from. "
+            "When provided, this takes precedence over PointNet-only initialization."
+        ),
+    )
+    parser.add_argument(
         "--pointnet-variant",
         type=str,
         default="auto",
@@ -700,6 +781,7 @@ def main():
         record_video=args.record_video,
         video_interval=args.video_interval,
         pointnet_checkpoint_path=args.pointnet_checkpoint,
+        pretrained_model_checkpoint_path=args.pretrained_model_checkpoint,
         pointnet_variant=args.pointnet_variant,
         freeze_pointnet=args.freeze_pointnet,
         wandb_run_name=args.wandb_run_name,

@@ -68,6 +68,16 @@ def _normalized_shares(scores: Mapping[str, float]) -> OrderedDict:
     return OrderedDict((key, 100.0 * value / total) for key, value in scores.items())
 
 
+def _size_normalized_scores(
+    scores: Mapping[str, float], group_dims: Mapping[str, int]
+) -> OrderedDict:
+    normalized = OrderedDict()
+    for key, value in scores.items():
+        dim_count = int(group_dims.get(key, 0))
+        normalized[key] = 0.0 if dim_count <= 0 else float(value) / float(dim_count)
+    return normalized
+
+
 def _module_summary(module: nn.Module) -> Dict[str, float]:
     params = [parameter.detach().cpu().reshape(-1) for parameter in module.parameters()]
     if not params:
@@ -131,6 +141,16 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
         "pointcloud_feature_dim": pointcloud_feature_dim,
         "proprio_feature_dim": proprio_feature_dim,
         "proprio_input_dim": start,
+        "group_analysis_dims": OrderedDict(
+            pointcloud=pointcloud_feature_dim,
+            joint_state=joint_dim,
+            ee_position=ee_dim,
+            goal_position=goal_dim,
+        ),
+        "branch_analysis_dims": OrderedDict(
+            pointcloud=pointcloud_feature_dim,
+            proprio=proprio_feature_dim,
+        ),
         "proprio_slices": proprio_slices,
         "feature_slices": feature_slices,
     }
@@ -141,6 +161,8 @@ def _compute_policy_usage(
 ) -> Dict[str, object]:
     pointcloud_feature_dim = int(layout["pointcloud_feature_dim"])
     proprio_feature_dim = int(layout["proprio_feature_dim"])
+    group_analysis_dims = layout["group_analysis_dims"]
+    branch_analysis_dims = layout["branch_analysis_dims"]
     proprio_slices = layout["proprio_slices"]
     feature_slices = layout["feature_slices"]
     proprio_extractor = policy.features_extractor.proprioceptive_extractor
@@ -219,6 +241,29 @@ def _compute_policy_usage(
         )
         for key in actor_group_scores
     )
+    actor_group_relative_scores = _size_normalized_scores(
+        actor_group_scores, group_analysis_dims
+    )
+    critic_group_relative_scores = _size_normalized_scores(
+        critic_group_scores, group_analysis_dims
+    )
+    combined_group_relative_shares = OrderedDict(
+        (
+            key,
+            0.5
+            * (
+                _normalized_shares(actor_group_relative_scores)[key]
+                + _normalized_shares(critic_group_relative_scores)[key]
+            ),
+        )
+        for key in actor_group_relative_scores
+    )
+    actor_branch_relative_scores = _size_normalized_scores(
+        actor_branch_scores, branch_analysis_dims
+    )
+    critic_branch_relative_scores = _size_normalized_scores(
+        critic_branch_scores, branch_analysis_dims
+    )
 
     first_proprio_linear = _linear_layers(proprio_extractor.mlp)[0]
     proprio_first_layer_scores = OrderedDict(
@@ -234,6 +279,9 @@ def _compute_policy_usage(
         )
         for key, column_slice in proprio_slices.items()
     )
+    proprio_first_layer_relative_scores = _size_normalized_scores(
+        proprio_first_layer_scores, group_analysis_dims
+    )
 
     pointnet_summary = _module_summary(policy.features_extractor.pointnet_extractor)
     proprio_summary = _module_summary(proprio_extractor)
@@ -246,12 +294,31 @@ def _compute_policy_usage(
         "actor_group_shares": _normalized_shares(actor_group_scores),
         "critic_group_shares": _normalized_shares(critic_group_scores),
         "combined_group_shares": combined_group_shares,
+        "actor_group_relative_scores": actor_group_relative_scores,
+        "critic_group_relative_scores": critic_group_relative_scores,
+        "actor_group_relative_shares": _normalized_shares(actor_group_relative_scores),
+        "critic_group_relative_shares": _normalized_shares(
+            critic_group_relative_scores
+        ),
+        "combined_group_relative_shares": combined_group_relative_shares,
         "actor_branch_scores": actor_branch_scores,
         "critic_branch_scores": critic_branch_scores,
         "actor_branch_shares": _normalized_shares(actor_branch_scores),
         "critic_branch_shares": _normalized_shares(critic_branch_scores),
+        "actor_branch_relative_scores": actor_branch_relative_scores,
+        "critic_branch_relative_scores": critic_branch_relative_scores,
+        "actor_branch_relative_shares": _normalized_shares(
+            actor_branch_relative_scores
+        ),
+        "critic_branch_relative_shares": _normalized_shares(
+            critic_branch_relative_scores
+        ),
         "proprio_first_layer_scores": proprio_first_layer_scores,
         "proprio_first_layer_shares": _normalized_shares(proprio_first_layer_scores),
+        "proprio_first_layer_relative_scores": proprio_first_layer_relative_scores,
+        "proprio_first_layer_relative_shares": _normalized_shares(
+            proprio_first_layer_relative_scores
+        ),
         "pointnet_summary": pointnet_summary,
         "proprio_summary": proprio_summary,
         "pointcloud_feature_dim": pointcloud_feature_dim,
@@ -283,7 +350,9 @@ def _build_report(
         "  - Loads the trained PPO policy and inspects trained weights only.",
         "  - Pointcloud usage is measured at the learned pointcloud feature branch.",
         "  - joint_state / ee_position / goal_position usage is traced through the proprio MLP into actor and critic readouts.",
-        "  - Shares are based on absolute effective linear weight mass, so they are an approximation of reliance, not a causal attribution.",
+        "  - Absolute shares are based on effective linear weight mass, so they are an approximation of reliance, not a causal attribution.",
+        "  - Relative importance shares divide each group's score by its analysis dimensionality before normalizing across groups.",
+        "  - For pointcloud this uses learned pointcloud feature width, because the point encoder is nonlinear and the script does not trace attribution back to raw points.",
         "",
         "Observation layout:",
         f"  - pointcloud: shape={layout['pointcloud_shape']} raw_dims={raw_dims['pointcloud']}",
@@ -292,6 +361,10 @@ def _build_report(
         f"  - goal_position: dims={raw_dims['goal_position']}",
         f"  - pointcloud feature dim: {layout['pointcloud_feature_dim']}",
         f"  - proprio feature dim: {layout['proprio_feature_dim']}",
+        "  - size-normalized group dims: "
+        + ", ".join(
+            f"{key}={value}" for key, value in layout["group_analysis_dims"].items()
+        ),
         "",
     ]
 
@@ -315,6 +388,27 @@ def _build_report(
     lines.append("")
     lines.extend(
         _format_score_lines(
+            "Size-normalized actor relative importance shares:",
+            usage["actor_group_relative_shares"],
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
+            "Size-normalized critic relative importance shares:",
+            usage["critic_group_relative_shares"],
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
+            "Size-normalized average actor/critic relative importance shares:",
+            usage["combined_group_relative_shares"],
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
             "Actor branch shares at fused feature interface:",
             usage["actor_branch_shares"],
         )
@@ -329,7 +423,28 @@ def _build_report(
     lines.append("")
     lines.extend(
         _format_score_lines(
+            "Size-normalized fused actor branch relative importance:",
+            usage["actor_branch_relative_shares"],
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
+            "Size-normalized fused critic branch relative importance:",
+            usage["critic_branch_relative_shares"],
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
             "Proprio first-layer input shares:", usage["proprio_first_layer_shares"]
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_score_lines(
+            "Size-normalized proprio first-layer relative importance:",
+            usage["proprio_first_layer_relative_shares"],
         )
     )
     lines.append("")
@@ -353,8 +468,13 @@ def _build_report(
     lines.append("  - actor_usage.png")
     lines.append("  - critic_usage.png")
     lines.append("  - combined_usage.png")
+    lines.append("  - actor_relative_usage.png")
+    lines.append("  - critic_relative_usage.png")
+    lines.append("  - combined_relative_usage.png")
     lines.append("  - proprio_first_layer.png")
+    lines.append("  - proprio_first_layer_relative.png")
     lines.append("  - branch_usage.png")
+    lines.append("  - branch_relative_usage.png")
     return "\n".join(lines)
 
 
@@ -457,6 +577,8 @@ def _write_outputs(
             "pointcloud_feature_dim": int(layout["pointcloud_feature_dim"]),
             "proprio_feature_dim": int(layout["proprio_feature_dim"]),
             "proprio_input_dim": int(layout["proprio_input_dim"]),
+            "group_analysis_dims": dict(layout["group_analysis_dims"]),
+            "branch_analysis_dims": dict(layout["branch_analysis_dims"]),
         },
         "usage": json.loads(json.dumps(usage)),
     }
@@ -490,10 +612,34 @@ def _write_outputs(
         subtitle="Mean of normalized actor and critic shares",
     )
     _draw_bar_chart(
+        title="Actor Relative Importance",
+        scores=usage["actor_group_relative_shares"],
+        output_path=output_dir / "actor_relative_usage.png",
+        subtitle="Per-dimension normalized actor importance by observation group",
+    )
+    _draw_bar_chart(
+        title="Critic Relative Importance",
+        scores=usage["critic_group_relative_shares"],
+        output_path=output_dir / "critic_relative_usage.png",
+        subtitle="Per-dimension normalized critic importance by observation group",
+    )
+    _draw_bar_chart(
+        title="Average Actor/Critic Relative Importance",
+        scores=usage["combined_group_relative_shares"],
+        output_path=output_dir / "combined_relative_usage.png",
+        subtitle="Mean of size-normalized actor and critic shares",
+    )
+    _draw_bar_chart(
         title="Proprio First-Layer Input Usage",
         scores=usage["proprio_first_layer_shares"],
         output_path=output_dir / "proprio_first_layer.png",
         subtitle="How the first proprio MLP layer allocates weight across proprio inputs",
+    )
+    _draw_bar_chart(
+        title="Proprio First-Layer Relative Importance",
+        scores=usage["proprio_first_layer_relative_shares"],
+        output_path=output_dir / "proprio_first_layer_relative.png",
+        subtitle="First proprio MLP layer importance normalized by input-group size",
     )
     branch_average = OrderedDict(
         pointcloud=0.5
@@ -507,11 +653,29 @@ def _write_outputs(
             + usage["critic_branch_shares"]["proprio"]
         ),
     )
+    branch_relative_average = OrderedDict(
+        pointcloud=0.5
+        * (
+            usage["actor_branch_relative_shares"]["pointcloud"]
+            + usage["critic_branch_relative_shares"]["pointcloud"]
+        ),
+        proprio=0.5
+        * (
+            usage["actor_branch_relative_shares"]["proprio"]
+            + usage["critic_branch_relative_shares"]["proprio"]
+        ),
+    )
     _draw_bar_chart(
         title="Fused Branch Usage",
         scores=branch_average,
         output_path=output_dir / "branch_usage.png",
         subtitle="Average actor/critic reliance on pointcloud vs proprio learned features",
+    )
+    _draw_bar_chart(
+        title="Fused Branch Relative Importance",
+        scores=branch_relative_average,
+        output_path=output_dir / "branch_relative_usage.png",
+        subtitle="Average actor/critic branch importance normalized by feature width",
     )
 
 
@@ -764,6 +928,50 @@ def _write_run_outputs(
         )
         for key in BRANCH_KEYS
     )
+    combined_relative_series = OrderedDict(
+        (
+            key,
+            [
+                float(result["usage"]["combined_group_relative_shares"][key])
+                for result in results
+            ],
+        )
+        for key in OBSERVATION_GROUP_KEYS
+    )
+    actor_relative_series = OrderedDict(
+        (
+            key,
+            [
+                float(result["usage"]["actor_group_relative_shares"][key])
+                for result in results
+            ],
+        )
+        for key in OBSERVATION_GROUP_KEYS
+    )
+    critic_relative_series = OrderedDict(
+        (
+            key,
+            [
+                float(result["usage"]["critic_group_relative_shares"][key])
+                for result in results
+            ],
+        )
+        for key in OBSERVATION_GROUP_KEYS
+    )
+    branch_relative_series = OrderedDict(
+        (
+            key,
+            [
+                0.5
+                * (
+                    float(result["usage"]["actor_branch_relative_shares"][key])
+                    + float(result["usage"]["critic_branch_relative_shares"][key])
+                )
+                for result in results
+            ],
+        )
+        for key in BRANCH_KEYS
+    )
 
     summary = {
         "input_dir": str(input_dir),
@@ -774,17 +982,30 @@ def _write_run_outputs(
                 "checkpoint_path": str(result["checkpoint_path"]),
                 "analysis_dir": str(result["analysis_dir"]),
                 "combined_group_shares": result["usage"]["combined_group_shares"],
+                "combined_group_relative_shares": result["usage"][
+                    "combined_group_relative_shares"
+                ],
                 "actor_group_shares": result["usage"]["actor_group_shares"],
                 "critic_group_shares": result["usage"]["critic_group_shares"],
+                "actor_group_relative_shares": result["usage"][
+                    "actor_group_relative_shares"
+                ],
+                "critic_group_relative_shares": result["usage"][
+                    "critic_group_relative_shares"
+                ],
             }
             for result in results
         ],
         "trend_series": {
             "steps": steps,
             "combined_group_shares": combined_series,
+            "combined_group_relative_shares": combined_relative_series,
             "actor_group_shares": actor_series,
+            "actor_group_relative_shares": actor_relative_series,
             "critic_group_shares": critic_series,
+            "critic_group_relative_shares": critic_relative_series,
             "branch_average_shares": branch_series,
+            "branch_average_relative_shares": branch_relative_series,
         },
     }
 
@@ -813,6 +1034,10 @@ def _write_run_outputs(
     report_lines.append("  - actor_usage_trend.png")
     report_lines.append("  - critic_usage_trend.png")
     report_lines.append("  - branch_usage_trend.png")
+    report_lines.append("  - combined_relative_usage_trend.png")
+    report_lines.append("  - actor_relative_usage_trend.png")
+    report_lines.append("  - critic_relative_usage_trend.png")
+    report_lines.append("  - branch_relative_usage_trend.png")
 
     (output_dir / "observation_usage_trends.json").write_text(
         json.dumps(json.loads(json.dumps(summary)), indent=2),
@@ -850,6 +1075,34 @@ def _write_run_outputs(
         series_by_label=branch_series,
         output_path=output_dir / "branch_usage_trend.png",
         subtitle="Average actor/critic reliance on pointcloud and proprio learned features",
+    )
+    _draw_trend_chart(
+        title="Average Actor/Critic Relative Importance Over Training",
+        steps=steps,
+        series_by_label=combined_relative_series,
+        output_path=output_dir / "combined_relative_usage_trend.png",
+        subtitle="Size-normalized combined observation-group shares for each checkpoint",
+    )
+    _draw_trend_chart(
+        title="Actor Relative Importance Over Training",
+        steps=steps,
+        series_by_label=actor_relative_series,
+        output_path=output_dir / "actor_relative_usage_trend.png",
+        subtitle="Size-normalized actor observation-group shares for each checkpoint",
+    )
+    _draw_trend_chart(
+        title="Critic Relative Importance Over Training",
+        steps=steps,
+        series_by_label=critic_relative_series,
+        output_path=output_dir / "critic_relative_usage_trend.png",
+        subtitle="Size-normalized critic observation-group shares for each checkpoint",
+    )
+    _draw_trend_chart(
+        title="Fused Branch Relative Importance Over Training",
+        steps=steps,
+        series_by_label=branch_relative_series,
+        output_path=output_dir / "branch_relative_usage_trend.png",
+        subtitle="Average actor/critic branch importance normalized by feature width",
     )
 
 
