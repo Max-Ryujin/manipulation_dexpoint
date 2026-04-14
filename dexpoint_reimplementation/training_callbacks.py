@@ -16,6 +16,22 @@ else:
 class TaskInfoLoggingCallback(BaseCallback):
     """Aggregate scalar task metrics from info and report them per rollout."""
 
+    WANDB_TASK_METRIC_WHITELISTS = {
+        "lifting": {
+            "rollout/task/target_table_distance",
+            "rollout/task/gripper_can_distance",
+            "rollout/task/gripper_open_fraction",
+            "rollout/task/close_reward",
+            "rollout/task/time_penalty",
+            "rollout/task/is_success",
+            "rollout/task/reward_total",
+            "episode/is_success",
+            "episode/reward_total",
+            "episode/reward",
+            "episode/length",
+        }
+    }
+
     EPISODE_REASON_ALIASES = {
         "success": "success",
         "step_limit": "step_limit",
@@ -109,4 +125,17 @@ class TaskInfoLoggingCallback(BaseCallback):
             self.logger.record(metric_name, value)
 
         if self.use_wandb and wandb.run is not None and aggregated_metrics:
-            wandb.log(aggregated_metrics)
+            wandb_metrics = dict(aggregated_metrics)
+            whitelist = self.WANDB_TASK_METRIC_WHITELISTS.get(
+                self.training_env.get_attr("task_name")[0]
+                if self.training_env is not None
+                else None
+            )
+            if whitelist is not None:
+                wandb_metrics = {
+                    metric_name: value
+                    for metric_name, value in aggregated_metrics.items()
+                    if metric_name in whitelist
+                }
+            if wandb_metrics:
+                wandb.log(wandb_metrics)

@@ -292,12 +292,15 @@ def train_dexpoint(
         raise ValueError(f"num_envs must be >= 1, got {num_envs}")
 
     if use_wandb:
+        project_name = ""
+        if task_name == "reaching":
+            project_name = "dexpoint-franka_reaching"
+        elif task_name == "lifting":
+            project_name = "dexpoint-franka_lifting"
+        else:
+            project_name = "dexpoint-franka"
         wandb.init(
-            project=(
-                "dexpoint-franka_reaching"
-                if task_name == "reaching"
-                else "dexpoint-franka"
-            ),
+            project=(project_name if project_name else None),
             name=resolved_wandb_run_name,
             config={
                 "task": task_name,
@@ -686,7 +689,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping", "reaching"],
+        choices=["grasping", "reaching", "lifting"],
         help="Task to train on",
     )
     parser.add_argument(
