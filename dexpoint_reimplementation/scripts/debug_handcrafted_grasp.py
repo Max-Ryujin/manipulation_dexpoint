@@ -16,13 +16,9 @@ if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
 import mujoco
 import numpy as np
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+from _script_bootstrap import DEXPOINT_ROOT, ensure_script_imports
 
-ROOT = SCRIPT_DIR.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ensure_script_imports()
 
 from franka_gym_env import FrankaGymEnvironment
 from tasks import GraspingTask, create_task_config
@@ -33,39 +29,43 @@ from ycb_scene import DEFAULT_YCB_OBJECT_ROOT
 # For the attachment_site frame, this rotates the approach axis to point down the
 # world -Z direction, producing a vertical top grasp rather than a side grasp.
 TOP_DOWN_QUAT = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "debug_handcrafted_grasp_runs"
+DEFAULT_OUTPUT_DIR = DEXPOINT_ROOT / "debug_handcrafted_grasp_runs"
 INFO_KEYS = [
     "reward_total",
-    "distance_reward",
-    "orientation_reward",
-    "grasp_reward",
-    "lift_reward",
-    "goal_reward",
-    "goal_height_reward",
+    "reaching_reward",
+    "lifting_reward",
+    "reaching_distance_reward",
+    "reaching_open_reward",
+    "reaching_action_penalty",
+    "reaching_time_penalty",
+    "reaching_success_bonus",
+    "close_reward_component",
+    "bonus_reward_component",
+    "approach_reward_component",
+    "target_table_distance_component",
+    "lifting_time_penalty_component",
     "time_penalty",
-    "success_bonus",
-    "reach_distance",
-    "ee_target_xy_distance",
-    "ee_target_z_distance",
-    "gripper_opening_width",
+    "curriculum_phase",
+    "reaching_weight",
+    "close_phase_weight",
+    "lifting_weight",
+    "close_weight",
+    "bonus_weight",
+    "table_distance_weight",
+    "ee_distance",
+    "gripper_can_distance",
+    "target_table_distance",
     "gripper_open_fraction",
     "gripper_actuator_force",
-    "orientation_down_alignment",
-    "distance_score",
-    "orientation_score",
-    "caging_score",
-    "force_score",
-    "goal_distance",
-    "goal_xy_distance",
-    "goal_z_distance",
-    "goal_height_distance",
-    "target_height_above_table",
-    "target_lift",
-    "lift_progress",
-    "between_fingers_score",
-    "grasp_resistance_score",
-    "target_between_fingers",
-    "grasp_detected",
+    "close_reward",
+    "bonus_reward",
+    "approach_reward",
+    "table_distance_reward",
+    "in_success_pose",
+    "success_hold_count",
+    "success_hold_steps",
+    "bonus_reward_active",
+    "bonus_hold_count",
     "is_success",
     "goal_reward_active",
 ]

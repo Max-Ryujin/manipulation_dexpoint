@@ -74,3 +74,4 @@ log/
 *.png
 *.csv
 *.mp4
+evaluation_runs/

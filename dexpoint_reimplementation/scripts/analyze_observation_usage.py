@@ -15,14 +15,9 @@ import torch as th
 import torch.nn as nn
 from PIL import Image, ImageDraw, ImageFont
 
+from _script_bootstrap import ensure_script_imports
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-WORKSPACE_ROOT = SCRIPT_DIR.parent
-
-for path in (SCRIPT_DIR, WORKSPACE_ROOT):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
+ensure_script_imports()
 
 import dexpoint_policy  # noqa: F401
 from dexart_baselines.stable_baselines3.common.save_util import load_from_zip_file
