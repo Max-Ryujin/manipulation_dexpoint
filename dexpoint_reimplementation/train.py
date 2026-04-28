@@ -3,13 +3,18 @@
 import imageio
 import numpy as np
 import argparse
+import re
 from pathlib import Path
 import json
 from datetime import datetime
 import sys
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
+import matplotlib
 import torch
 import wandb
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Add dexart to path
 root_path = Path(__file__).parent.parent
@@ -61,6 +66,42 @@ def add_batch_dimension(obs):
                 batched_obs[key] = value
         return batched_obs
     return obs
+
+
+def sanitize_metric_key(value: str) -> str:
+    """Normalize object names so they are safe to use in W&B metric keys."""
+    return re.sub(r"[^0-9A-Za-z_]+", "_", value).strip("_") or "object"
+
+
+def save_validation_reward_plot(
+    reward_trace: List[float],
+    plot_path: Path,
+    *,
+    object_name: str,
+    eval_try_index: int,
+    success: bool,
+) -> None:
+    """Persist a per-step validation reward plot for one object/try pair."""
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    rewards = np.asarray(reward_trace, dtype=np.float32)
+    cumulative_rewards = np.cumsum(rewards)
+    step_axis = np.arange(1, len(rewards) + 1)
+
+    axes[0].plot(step_axis, rewards, color="#1f77b4", linewidth=1.5)
+    axes[0].set_ylabel("Reward")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(step_axis, cumulative_rewards, color="#d62728", linewidth=1.5)
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Cumulative")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"Validation rewards: {object_name} | try {eval_try_index:02d} | success={int(success)}"
+    )
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
 
 
 _HERE = Path(__file__).parent
@@ -129,7 +170,7 @@ def get_pretrained_policy_kwargs(
     *,
     freeze_pointnet: bool = False,
 ) -> dict:
-    """Load policy kwargs from a saved RL checkpoint for safe restoration."""
+    """Load policy kwargs from a saved RL checkpoint for compatible warm starts."""
     data, _, _ = load_from_zip_file(str(checkpoint_path), device="cpu")
     policy_kwargs = dict(data.get("policy_kwargs", {}))
 
@@ -140,6 +181,11 @@ def get_pretrained_policy_kwargs(
         policy_kwargs["freeze_pointnet"] = True
 
     return policy_kwargs
+
+
+def initialize_agent_from_checkpoint(agent, checkpoint_path: str) -> None:
+    """Warm-start a fresh agent from a saved RL checkpoint without restoring trainer state."""
+    agent.set_parameters(str(checkpoint_path), exact_match=True, device=agent.device)
 
 
 def create_output_dir():
@@ -163,6 +209,7 @@ def create_configured_environment(
     use_depth_only_pointcloud: bool = False,
     camera_height: int = EVAL_CAMERA_HEIGHT,
     camera_width: int = EVAL_CAMERA_WIDTH,
+    ycb_object_names: Optional[List[str]] = None,
 ) -> FrankaGymEnvironment:
     """Build and configure a FrankaGymEnvironment for training or evaluation."""
     env = FrankaGymEnvironment(
@@ -178,6 +225,7 @@ def create_configured_environment(
         pointcloud_point_size=pointcloud_point_size,
         pointcloud_alpha=pointcloud_alpha,
         use_depth_only_pointcloud=use_depth_only_pointcloud,
+        ycb_object_names=ycb_object_names,
     )
     task_config = create_task_config(
         task_name,
@@ -197,6 +245,7 @@ def make_environment_factory(
     camera_height: int = EVAL_CAMERA_HEIGHT,
     camera_width: int = EVAL_CAMERA_WIDTH,
     seed: Optional[int] = None,
+    ycb_object_names: Optional[List[str]] = None,
 ) -> Callable[[], FrankaGymEnvironment]:
     """Create a picklable environment factory for vectorized rollouts."""
 
@@ -209,12 +258,22 @@ def make_environment_factory(
             use_depth_only_pointcloud=use_depth_only_pointcloud,
             camera_height=camera_height,
             camera_width=camera_width,
+            ycb_object_names=ycb_object_names,
         )
         if seed is not None:
             env.seed(seed)
         return env
 
     return _make_env
+
+
+def get_validation_object_names(
+    eval_env: FrankaGymEnvironment, ycb_object_names: Optional[List[str]]
+) -> List[str]:
+    """Return the deterministic object list to use during validation."""
+    if ycb_object_names:
+        return list(ycb_object_names)
+    return eval_env.get_available_object_names()
 
 
 def train_dexpoint(
@@ -225,7 +284,7 @@ def train_dexpoint(
     learning_rate: float = 3e-4,
     batch_size: int = 64,
     n_epochs: int = 6,
-    n_steps: int = 2400,
+    n_steps: int = 10000,
     save_interval: int = 100000,
     verbose: int = 1,
     use_wandb: bool = False,
@@ -236,6 +295,9 @@ def train_dexpoint(
     pointnet_variant: str = "auto",
     freeze_pointnet: bool = False,
     wandb_run_name: Optional[str] = None,
+    resume_training_state: bool = False,
+    ycb_object_names: Optional[List[str]] = None,
+    eval_tries: int = 1,
 ):
     """
     Train a DexPoint policy using PPO or A2C.
@@ -255,10 +317,17 @@ def train_dexpoint(
         record_video: Record training videos
         video_interval: Record video every N timesteps
         pointnet_checkpoint_path: Optional PointNet encoder checkpoint
-        pretrained_model_checkpoint_path: Optional RL checkpoint to continue training from
+        pretrained_model_checkpoint_path: Optional RL checkpoint used to initialize
+            policy weights for a fresh run, unless resume_training_state=True
         pointnet_variant: PointNet architecture variant or "auto" to infer it
         freeze_pointnet: Whether to keep PointNet frozen during RL training
         wandb_run_name: Optional explicit Weights & Biases run name
+        resume_training_state: Whether to fully resume optimizer/timestep state from
+            pretrained_model_checkpoint_path instead of only copying policy weights
+        ycb_object_names: Optional list of YCB object folder names to sample per episode
+            (e.g. ["005_tomato_soup_can", "006_mustard_bottle"]).  When provided, every
+            environment reloads a randomly chosen object at the start of each episode.
+        eval_tries: Number of validation episodes to run per object whenever evaluation triggers.
     """
     print("\n" + "=" * 70)
     print("DexPoint Training - Franka Manipulation")
@@ -283,13 +352,22 @@ def train_dexpoint(
         )
     )
     initialization_mode = (
-        "pretrained_model"
-        if pretrained_model_checkpoint_path is not None
-        else "pointnet_only"
+        "pretrained_model_resume"
+        if pretrained_model_checkpoint_path is not None and resume_training_state
+        else (
+            "pretrained_model_weights"
+            if pretrained_model_checkpoint_path is not None
+            else "pointnet_only"
+        )
     )
 
     if num_envs < 1:
         raise ValueError(f"num_envs must be >= 1, got {num_envs}")
+    if eval_tries < 1:
+        raise ValueError(f"eval_tries must be >= 1, got {eval_tries}")
+
+    if ycb_object_names and len(ycb_object_names) > 0:
+        print(f"  - Multi-object pool: {ycb_object_names}")
 
     if use_wandb:
         project_name = ""
@@ -297,6 +375,10 @@ def train_dexpoint(
             project_name = "dexpoint-franka_reaching"
         elif task_name == "lifting":
             project_name = "dexpoint-franka_lifting"
+        elif task_name == "lifting_only":
+            project_name = "dexpoint-franka_lifting"
+        elif task_name == "placing":
+            project_name = "dexpoint-franka_placing"
         else:
             project_name = "dexpoint-franka"
         wandb.init(
@@ -318,9 +400,14 @@ def train_dexpoint(
                 "pointnet_variant": resolved_pointnet_variant,
                 "freeze_pointnet": freeze_pointnet,
                 "initialization_mode": initialization_mode,
+                "resume_training_state": resume_training_state,
                 "wandb_run_name": resolved_wandb_run_name,
+                "ycb_object_names": ycb_object_names,
+                "eval_tries": eval_tries,
             },
         )
+        wandb.define_metric("validation/timesteps")
+        wandb.define_metric("validation/*", step_metric="validation/timesteps")
 
     # Create output directory
     run_dir = create_output_dir()
@@ -334,6 +421,7 @@ def train_dexpoint(
         use_depth_only_pointcloud=True,
         camera_height=TRAIN_CAMERA_HEIGHT,
         camera_width=TRAIN_CAMERA_WIDTH,
+        ycb_object_names=ycb_object_names,
     )
     env = reference_env
     if num_envs > 1:
@@ -347,6 +435,7 @@ def train_dexpoint(
                     camera_height=TRAIN_CAMERA_HEIGHT,
                     camera_width=TRAIN_CAMERA_WIDTH,
                     seed=env_index,
+                    ycb_object_names=ycb_object_names,
                 )
                 for env_index in range(num_envs)
             ]
@@ -358,6 +447,7 @@ def train_dexpoint(
             use_depth_only_pointcloud=False,
             camera_height=EVAL_CAMERA_HEIGHT,
             camera_width=EVAL_CAMERA_WIDTH,
+            ycb_object_names=ycb_object_names,
         )
         if record_video
         else None
@@ -369,7 +459,15 @@ def train_dexpoint(
     print(f"  - PointNet variant: {resolved_pointnet_variant}")
     print(f"  - Initialization mode: {initialization_mode}")
     if pretrained_model_checkpoint_path is not None:
-        print(f"  - Pretrained RL checkpoint: {pretrained_model_checkpoint_path}")
+        checkpoint_mode = (
+            "full training-state resume"
+            if resume_training_state
+            else "policy-weight warm start"
+        )
+        print(
+            f"  - Pretrained RL checkpoint ({checkpoint_mode}): "
+            f"{pretrained_model_checkpoint_path}"
+        )
     elif pointnet_checkpoint_path is not None:
         print(f"  - Pretrained PointNet checkpoint: {pointnet_checkpoint_path}")
     print(f"  - Observation space: {env.observation_space}")
@@ -381,7 +479,14 @@ def train_dexpoint(
     agent = None
 
     if agent_name == "ppo":
-        if pretrained_model_checkpoint_path is not None:
+        policy_kwargs = pretrained_policy_kwargs or {
+            "net_arch": [dict(pi=[128, 128], vf=[128, 128])],
+            "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+            "pointnet_variant": resolved_pointnet_variant,
+            "pointnet_checkpoint_path": pointnet_checkpoint_path,
+            "freeze_pointnet": freeze_pointnet,
+        }
+        if pretrained_model_checkpoint_path is not None and resume_training_state:
             agent = PPO.load(
                 pretrained_model_checkpoint_path,
                 env=env,
@@ -395,7 +500,7 @@ def train_dexpoint(
                 wandb_project="dexpoint-franka" if use_wandb else None,
                 wandb_run_name=resolved_wandb_run_name if use_wandb else None,
             )
-            print(f"|Loaded PPO agent from {pretrained_model_checkpoint_path}")
+            print(f"|Resumed PPO agent from {pretrained_model_checkpoint_path}")
         else:
             agent = PPO(
                 policy=DexPointPolicy,
@@ -415,20 +520,29 @@ def train_dexpoint(
                 sde_sample_freq=-1,
                 target_kl=None,
                 create_eval_env=False,
-                policy_kwargs={
-                    "net_arch": [dict(pi=[128, 128], vf=[128, 128])],
-                    "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                    "pointnet_variant": resolved_pointnet_variant,
-                    "pointnet_checkpoint_path": pointnet_checkpoint_path,
-                    "freeze_pointnet": freeze_pointnet,
-                },
+                policy_kwargs=policy_kwargs,
                 verbose=verbose,
                 wandb_project="dexpoint-franka" if use_wandb else None,
                 wandb_run_name=resolved_wandb_run_name if use_wandb else None,
             )
-            print(f"|PPO agent created")
+            if pretrained_model_checkpoint_path is not None:
+                initialize_agent_from_checkpoint(
+                    agent,
+                    pretrained_model_checkpoint_path,
+                )
+                print(
+                    f"|Initialized PPO agent weights from {pretrained_model_checkpoint_path}"
+                )
+            else:
+                print(f"|PPO agent created")
     elif agent_name == "a2c":
-        if pretrained_model_checkpoint_path is not None:
+        policy_kwargs = pretrained_policy_kwargs or {
+            "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+            "pointnet_variant": resolved_pointnet_variant,
+            "pointnet_checkpoint_path": pointnet_checkpoint_path,
+            "freeze_pointnet": freeze_pointnet,
+        }
+        if pretrained_model_checkpoint_path is not None and resume_training_state:
             agent = A2C.load(
                 pretrained_model_checkpoint_path,
                 env=env,
@@ -438,7 +552,7 @@ def train_dexpoint(
                 n_steps=n_steps // 2,
                 verbose=verbose,
             )
-            print(f"|Loaded A2C agent from {pretrained_model_checkpoint_path}")
+            print(f"|Resumed A2C agent from {pretrained_model_checkpoint_path}")
         else:
             agent = A2C(
                 policy=DexPointPolicy,
@@ -451,15 +565,19 @@ def train_dexpoint(
                 use_sde=False,
                 sde_sample_freq=-1,
                 create_eval_env=False,
-                policy_kwargs={
-                    "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
-                    "pointnet_variant": resolved_pointnet_variant,
-                    "pointnet_checkpoint_path": pointnet_checkpoint_path,
-                    "freeze_pointnet": freeze_pointnet,
-                },
+                policy_kwargs=policy_kwargs,
                 verbose=verbose,
             )
-            print(f"|A2C agent created")
+            if pretrained_model_checkpoint_path is not None:
+                initialize_agent_from_checkpoint(
+                    agent,
+                    pretrained_model_checkpoint_path,
+                )
+                print(
+                    f"|Initialized A2C agent weights from {pretrained_model_checkpoint_path}"
+                )
+            else:
+                print(f"|A2C agent created")
 
     if agent is None:
         print(f"Unsupported agent: {agent_name}")
@@ -480,6 +598,7 @@ def train_dexpoint(
     print(f"  - Epochs per update: {n_epochs}")
     print(f"  - Steps per update: {n_steps}")
     print(f"  - Save checkpoint every: {save_interval} steps")
+    print(f"  - Validation tries per object: {eval_tries}")
 
     # Save training config
     config = {
@@ -499,6 +618,8 @@ def train_dexpoint(
         "wandb_run_name": resolved_wandb_run_name if use_wandb else None,
         "initialization_mode": initialization_mode,
         "pretrained_model_checkpoint_path": pretrained_model_checkpoint_path,
+        "resume_training_state": resume_training_state,
+        "eval_tries": eval_tries,
         "pointnet_variant": resolved_pointnet_variant,
         "env_config": {
             "num_points": 512,
@@ -510,9 +631,12 @@ def train_dexpoint(
             "eval_camera_width": EVAL_CAMERA_WIDTH,
             "target_body_name": reference_env.target_body_name,
             "ycb_object_root": reference_env.ycb_object_root.as_posix(),
+            "ycb_asset_source": reference_env.ycb_asset_source,
+            "target_scale": reference_env.target_scale,
         },
         "pointnet_checkpoint_path": pointnet_checkpoint_path,
         "freeze_pointnet": freeze_pointnet,
+        "ycb_object_names": ycb_object_names,
     }
 
     config_path = run_dir / "config.json"
@@ -553,78 +677,218 @@ def train_dexpoint(
 
             # Record video if needed
             if video_recording_enabled and steps_so_far >= next_video_step:
-                print(f"    Recording validation video...")
-                video_frames = []
-                obs = eval_env.reset()
-                episode_reward = 0.0
-                episode_steps = 0
-                max_episode_steps_video = 1000
+                validation_object_names = get_validation_object_names(
+                    eval_env, ycb_object_names
+                )
+                validation_scalar_logs = {}
+                validation_media_logs = {}
+                all_validation_rewards = []
+                all_validation_successes = []
+                all_validation_episode_lengths = []
+                representative_plot_path = None
+                representative_video_path = None
+                print(
+                    "    Recording validation episodes "
+                    f"({len(validation_object_names)} object(s) x {eval_tries} try/tries)..."
+                )
+                max_episode_steps_video = 200
 
-                while episode_steps < max_episode_steps_video:
-                    frame = eval_env.render_with_pointcloud(mode="rgb_array")
-                    if frame is not None:
-                        video_frames.append(frame)
+                for object_name in validation_object_names:
+                    object_metric_key = sanitize_metric_key(object_name)
+                    object_rewards = []
+                    object_successes = []
+                    object_episode_lengths = []
+                    eval_env.set_fixed_object(object_name)
+                    for eval_try_index in range(1, eval_tries + 1):
+                        video_frames = []
+                        obs = eval_env.reset()
+                        episode_reward = 0.0
+                        episode_steps = 0
+                        success = False
+                        bonus_reward = 0.0
+                        gripper_actuator_force = 0.0
+                        reward_trace = []
 
-                    batched_obs = add_batch_dimension(obs)
-                    action, _ = agent.predict(batched_obs, deterministic=True)
+                        while episode_steps < max_episode_steps_video:
+                            frame = eval_env.render_with_pointcloud(mode="rgb_array")
+                            if frame is not None:
+                                video_frames.append(frame)
 
-                    if isinstance(action, np.ndarray) and action.ndim > 1:
-                        action = action[0]
+                            batched_obs = add_batch_dimension(obs)
+                            action, _ = agent.predict(batched_obs, deterministic=True)
 
-                    obs, reward, done, info = eval_env.step(action)
-                    episode_reward += reward
-                    episode_steps += 1
+                            if isinstance(action, np.ndarray) and action.ndim > 1:
+                                action = action[0]
 
-                    success = info.get("is_success", False)
+                            obs, reward, done, info = eval_env.step(action)
+                            episode_reward += reward
+                            reward_trace.append(float(reward))
+                            episode_steps += 1
 
-                    if done:
-                        # check for success
-                        if success:
-                            print(
-                                f"    Episode success! Reward: {episode_reward:.2f}, Steps: {episode_steps}"
+                            success = bool(info.get("is_success", False))
+                            bonus_reward = float(info.get("bonus_reward", 0.0))
+                            gripper_actuator_force = float(
+                                info.get("gripper_actuator_force", 0.0)
                             )
 
+                            if done:
+                                if success:
+                                    print(
+                                        "    Validation success "
+                                        f"[{object_name} try {eval_try_index}] "
+                                        f"reward={episode_reward:.2f} steps={episode_steps}"
+                                    )
+                                break
+
+                        video_path = (
+                            run_dir
+                            / f"video_step_{steps_so_far}_{object_name}_try_{eval_try_index:02d}.mp4"
+                        )
+                        plot_path = (
+                            run_dir
+                            / f"plot_step_{steps_so_far}_{object_name}_try_{eval_try_index:02d}.png"
+                        )
+                        save_validation_reward_plot(
+                            reward_trace,
+                            plot_path,
+                            object_name=object_name,
+                            eval_try_index=eval_try_index,
+                            success=success,
+                        )
+                        if representative_plot_path is None:
+                            representative_plot_path = plot_path
+
+                        object_rewards.append(float(episode_reward))
+                        object_successes.append(float(success))
+                        object_episode_lengths.append(float(episode_steps))
+                        all_validation_rewards.append(float(episode_reward))
+                        all_validation_successes.append(float(success))
+                        all_validation_episode_lengths.append(float(episode_steps))
+
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/try_{eval_try_index:02d}/episode_reward"
+                        ] = float(episode_reward)
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/try_{eval_try_index:02d}/episode_steps"
+                        ] = float(episode_steps)
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/try_{eval_try_index:02d}/episode_success"
+                        ] = float(success)
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/try_{eval_try_index:02d}/bonus_reward"
+                        ] = float(bonus_reward)
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/try_{eval_try_index:02d}/gripper_actuator_force"
+                        ] = float(gripper_actuator_force)
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/episode_reward"
+                        ] = float(episode_reward)
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/episode_steps"
+                        ] = float(episode_steps)
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/episode_success"
+                        ] = float(success)
+                        validation_media_logs[
+                            f"validation/plots/{object_metric_key}/try_{eval_try_index:02d}"
+                        ] = (
+                            wandb.Image(str(plot_path))
+                            if use_wandb and wandb.run is not None
+                            else None
+                        )
+
+                        if video_frames:
+                            try:
+                                imageio.mimwrite(video_path, video_frames, fps=30)
+                                print(f"    Video saved: {video_path}")
+                                if representative_video_path is None:
+                                    representative_video_path = video_path
+                                if use_wandb and wandb.run is not None:
+                                    validation_media_logs[
+                                        f"validation/videos/{object_metric_key}/try_{eval_try_index:02d}"
+                                    ] = wandb.Video(str(video_path), format="mp4")
+                            except (FileNotFoundError, OSError) as exc:
+                                video_recording_enabled = False
+                                print(
+                                    "    Video recording disabled for the rest of this run: "
+                                    f"{exc}"
+                                )
+                                if use_wandb and wandb.run is not None:
+                                    validation_scalar_logs[
+                                        f"validation/objects/{object_metric_key}/video_error"
+                                    ] = str(exc)
+                                break
+
+                    if not video_recording_enabled:
                         break
 
-                # Save video
-                if video_frames:
-                    video_path = run_dir / f"video_step_{steps_so_far}.mp4"
-                    try:
-                        imageio.mimwrite(video_path, video_frames, fps=30)
-                        print(f"    Video saved: {video_path}")
-                        if use_wandb and wandb.run is not None:
-                            wandb.log(
-                                {
-                                    "validation/episode_reward": episode_reward,
-                                    "validation/episode_steps": episode_steps,
-                                    "validation/video": wandb.Video(
-                                        str(video_path), format="mp4"
-                                    ),
-                                    "validation/episode_success": success,
-                                }
-                            )
-                    except (FileNotFoundError, OSError) as exc:
-                        video_recording_enabled = False
-                        print(
-                            "    Video recording disabled for the rest of this run: "
-                            f"{exc}"
-                        )
-                        if use_wandb and wandb.run is not None:
-                            wandb.log(
-                                {
-                                    "validation/episode_reward": episode_reward,
-                                    "validation/episode_steps": episode_steps,
-                                    "validation/episode_success": success,
-                                    "validation/video_error": str(exc),
-                                }
-                            )
-                elif use_wandb and wandb.run is not None:
-                    wandb.log(
-                        {
-                            "validation/episode_reward": episode_reward,
-                            "validation/episode_steps": episode_steps,
-                        }
+                    if object_rewards:
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/mean_episode_reward"
+                        ] = float(np.mean(object_rewards))
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/success_rate"
+                        ] = float(np.mean(object_successes))
+                        validation_scalar_logs[
+                            f"validation/objects/{object_metric_key}/mean_episode_steps"
+                        ] = float(np.mean(object_episode_lengths))
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/mean_episode_reward"
+                        ] = float(np.mean(object_rewards))
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/success_rate"
+                        ] = float(np.mean(object_successes))
+                        validation_scalar_logs[
+                            f"validation/{object_metric_key}/mean_episode_steps"
+                        ] = float(np.mean(object_episode_lengths))
+
+                eval_env.set_fixed_object(None)
+                if all_validation_rewards:
+                    validation_scalar_logs["validation/timesteps"] = float(
+                        steps_so_far
                     )
+                    validation_scalar_logs["validation/episode_reward"] = float(
+                        np.mean(all_validation_rewards)
+                    )
+                    validation_scalar_logs["validation/episode_steps"] = float(
+                        np.mean(all_validation_episode_lengths)
+                    )
+                    validation_scalar_logs["validation/episode_success"] = float(
+                        np.mean(all_validation_successes)
+                    )
+                    validation_scalar_logs["validation/mean_episode_reward"] = float(
+                        np.mean(all_validation_rewards)
+                    )
+                    validation_scalar_logs["validation/mean_episode_steps"] = float(
+                        np.mean(all_validation_episode_lengths)
+                    )
+                    validation_scalar_logs["validation/success_rate"] = float(
+                        np.mean(all_validation_successes)
+                    )
+                    validation_scalar_logs["validation/object_count"] = float(
+                        len(validation_object_names)
+                    )
+
+                if use_wandb and wandb.run is not None:
+                    if representative_plot_path is not None:
+                        validation_media_logs["validation/reward_plot"] = wandb.Image(
+                            str(representative_plot_path)
+                        )
+                    if representative_video_path is not None:
+                        validation_media_logs["validation/video"] = wandb.Video(
+                            str(representative_video_path), format="mp4"
+                        )
+
+                    combined_validation_logs = {
+                        key: value
+                        for key, value in {
+                            **validation_scalar_logs,
+                            **validation_media_logs,
+                        }.items()
+                        if value is not None
+                    }
+                    if combined_validation_logs:
+                        wandb.log(combined_validation_logs)
                 while next_video_step <= steps_so_far:
                     next_video_step += video_interval
 
@@ -632,15 +896,6 @@ def train_dexpoint(
             checkpoint_path = run_dir / f"model_checkpoint_{steps_so_far}.zip"
             agent.save(str(checkpoint_path))
             print(f"    Checkpoint saved: {checkpoint_path}")
-
-            # Log to W&B
-            if use_wandb:
-                wandb.log(
-                    {
-                        "training/timesteps": steps_so_far,
-                        "training/batch": step_count,
-                    }
-                )
 
         # Save final model
         final_model_path = run_dir / "model_final.zip"
@@ -654,7 +909,8 @@ def train_dexpoint(
                 {
                     "training/final_timesteps": steps_so_far,
                     "training/total_batches": step_count,
-                }
+                },
+                step=steps_so_far,
             )
             wandb.finish()
 
@@ -689,7 +945,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping", "reaching", "lifting"],
+        choices=["grasping", "reaching", "lifting", "lifting_only", "placing"],
         help="Task to train on",
     )
     parser.add_argument(
@@ -752,8 +1008,17 @@ def main():
         type=str,
         default=None,
         help=(
-            "Path to a pretrained RL checkpoint (.zip) to continue training from. "
-            "When provided, this takes precedence over PointNet-only initialization."
+            "Path to a pretrained RL checkpoint (.zip) whose policy weights are used "
+            "to initialize a fresh training run. When provided, this takes precedence "
+            "over PointNet-only initialization."
+        ),
+    )
+    parser.add_argument(
+        "--resume-training-state",
+        action="store_true",
+        help=(
+            "Fully resume optimizer, timestep, and scheduler state from "
+            "--pretrained-model-checkpoint instead of using it only for weight initialization."
         ),
     )
     parser.add_argument(
@@ -767,6 +1032,28 @@ def main():
         "--freeze-pointnet",
         action="store_true",
         help="Freeze the pretrained PointNet encoder during RL training.",
+    )
+    parser.add_argument(
+        "--eval-tries",
+        type=int,
+        default=1,
+        help=(
+            "Number of validation episodes to run per object whenever evaluation is triggered. "
+            "If a single object is configured, it runs this many times; if multiple objects are "
+            "configured, it runs this many times for each object."
+        ),
+    )
+    parser.add_argument(
+        "--ycb-object-names",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="OBJECT_NAME",
+        help=(
+            "List of YCB object folder names to randomly sample one from per episode "
+            "(e.g. 005_tomato_soup_can 006_mustard_bottle).  Requires pre-generated "
+            "YCB_sim scene files for each name."
+        ),
     )
 
     args = parser.parse_args()
@@ -788,6 +1075,9 @@ def main():
         pointnet_variant=args.pointnet_variant,
         freeze_pointnet=args.freeze_pointnet,
         wandb_run_name=args.wandb_run_name,
+        resume_training_state=args.resume_training_state,
+        ycb_object_names=args.ycb_object_names,
+        eval_tries=args.eval_tries,
     )
 
 

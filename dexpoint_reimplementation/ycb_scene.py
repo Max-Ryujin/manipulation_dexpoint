@@ -75,6 +75,7 @@ class YCBObjectSpec:
     mass: float = 0.15
     collision_geom_type: str = "box"
     source: str = YCB_ASSET_SOURCE_RAW
+    collision_mesh_path: Optional[Path] = None
 
 
 def _stable_box_inertia(half_extents: np.ndarray, mass: float) -> np.ndarray:
@@ -89,7 +90,9 @@ def _stable_box_inertia(half_extents: np.ndarray, mass: float) -> np.ndarray:
     )
 
 
-def _stable_cylinder_inertia(radius: float, half_height: float, mass: float) -> np.ndarray:
+def _stable_cylinder_inertia(
+    radius: float, half_height: float, mass: float
+) -> np.ndarray:
     full_height = 2.0 * half_height
     axial = 0.5 * mass * (radius**2)
     radial = (mass / 12.0) * (3.0 * (radius**2) + full_height**2)
@@ -148,6 +151,10 @@ def _collision_half_extents(
             raise ValueError("Cylinder collision size must have 2 values")
         radius, half_height = collision_size
         return np.array([radius, radius, half_height], dtype=np.float32)
+    if collision_geom_type == "mesh":
+        if len(collision_size) != 3:
+            raise ValueError("Mesh collision proxy half extents must have 3 values")
+        return collision_size.astype(np.float32)
     raise ValueError(f"Unsupported collision geometry type: {collision_geom_type}")
 
 
@@ -158,6 +165,8 @@ def _compute_rest_offset_z(
         z_half_extent = float(collision_size[2])
     elif collision_geom_type == "cylinder":
         z_half_extent = float(collision_size[1])
+    elif collision_geom_type == "mesh":
+        z_half_extent = float(collision_size[2])
     else:
         raise ValueError(f"Unsupported collision geometry type: {collision_geom_type}")
     min_z = float(collision_pos[2] - z_half_extent)
@@ -170,6 +179,16 @@ def _stable_inertia(object_spec: YCBObjectSpec) -> np.ndarray:
         half_height = float(object_spec.collision_size[1])
         return _stable_cylinder_inertia(radius, half_height, object_spec.mass)
     return _stable_box_inertia(object_spec.half_extents, mass=object_spec.mass)
+
+
+def _find_ycb_sim_reference_points(object_name: str) -> np.ndarray:
+    raw_object_root = DEFAULT_YCB_OBJECT_ROOT.parent / object_name
+    pointcloud_path = find_source_ply(raw_object_root)
+    if pointcloud_path is None:
+        raise FileNotFoundError(
+            f"Could not find raw YCB point cloud for YCB_sim object '{object_name}' under {raw_object_root}"
+        )
+    return clean_points(load_ply_vertices(pointcloud_path))
 
 
 def _format_vector(values: np.ndarray, precision: int = 6) -> str:
@@ -262,13 +281,13 @@ def _find_named_asset(
 
 def _default_scene_path(object_spec: YCBObjectSpec) -> Path:
     if object_spec.source == YCB_ASSET_SOURCE_YCB_SIM:
-        return _GENERATED_SCENE_DIR / f"scene_{object_spec.name}_{object_spec.source}.xml"
+        return (
+            _GENERATED_SCENE_DIR / f"scene_{object_spec.name}_{object_spec.source}.xml"
+        )
     return _GENERATED_SCENE_DIR / f"scene_{object_spec.name}.xml"
 
 
-def _load_raw_ycb_object_spec(
-    object_root: Path, scale: float = 1.0
-) -> YCBObjectSpec:
+def _load_raw_ycb_object_spec(object_root: Path, scale: float = 1.0) -> YCBObjectSpec:
     mesh_path = _find_visual_mesh(object_root)
     pointcloud_path = find_source_ply(object_root)
     if mesh_path is None or pointcloud_path is None:
@@ -303,9 +322,7 @@ def _load_raw_ycb_object_spec(
     )
 
 
-def _load_ycb_sim_object_spec(
-    object_root: Path, scale: float = 1.0
-) -> YCBObjectSpec:
+def _load_ycb_sim_object_spec(object_root: Path, scale: float = 1.0) -> YCBObjectSpec:
     object_name = object_root.name
     assets_include_path = _ycb_sim_include_path("assets", object_name)
     body_include_path = _ycb_sim_include_path("body", object_name)
@@ -316,10 +333,15 @@ def _load_ycb_sim_object_spec(
         )
 
     assets_root = ET.parse(assets_include_path).getroot()
-    mesh_element = _require_element(assets_root, ".//asset/mesh")
-    mesh_path = _resolve_ycb_sim_asset_path(
-        assets_include_path.parent, mesh_element.get("file", "")
-    )
+    asset_mesh_paths = {
+        mesh_element.get("name"): _resolve_ycb_sim_asset_path(
+            assets_include_path.parent, mesh_element.get("file", "")
+        )
+        for mesh_element in assets_root.findall(".//asset/mesh")
+        if mesh_element.get("name") is not None
+    }
+    if not asset_mesh_paths:
+        raise ValueError(f"YCB_sim assets for '{object_name}' do not define any meshes")
     texture_element = assets_root.find(".//asset/texture")
     texture_path = None
     if texture_element is not None and texture_element.get("file") is not None:
@@ -342,19 +364,52 @@ def _load_ycb_sim_object_spec(
             f"YCB_sim body include for '{object_name}' is missing visual or collision geom"
         )
 
+    visual_mesh_name = visual_geom.get("mesh")
+    if visual_mesh_name is None or visual_mesh_name not in asset_mesh_paths:
+        raise ValueError(
+            f"YCB_sim visual geom for '{object_name}' references unknown mesh '{visual_mesh_name}'"
+        )
+    mesh_path = asset_mesh_paths[visual_mesh_name]
+
     visual_pos = scale * _parse_vector(visual_geom.get("pos"), 3)
     collision_geom_type = collision_geom.get("type", "box")
-    size_length = 3 if collision_geom_type == "box" else 2 if collision_geom_type == "cylinder" else 0
-    if size_length == 0:
+    collision_size = np.zeros(0, dtype=np.float32)
+    collision_half_extents = np.zeros(3, dtype=np.float32)
+    collision_mesh_path: Optional[Path] = None
+    if collision_geom_type == "box":
+        collision_size = scale * _parse_vector(collision_geom.get("size"), 3)
+        collision_half_extents = _collision_half_extents(
+            collision_geom_type, collision_size
+        )
+    elif collision_geom_type == "cylinder":
+        collision_size = scale * _parse_vector(collision_geom.get("size"), 2)
+        collision_half_extents = _collision_half_extents(
+            collision_geom_type, collision_size
+        )
+    elif collision_geom_type == "mesh":
+        collision_mesh_name = collision_geom.get("mesh")
+        if collision_mesh_name is None or collision_mesh_name not in asset_mesh_paths:
+            raise ValueError(
+                f"YCB_sim collision geom for '{object_name}' references unknown mesh '{collision_mesh_name}'"
+            )
+        collision_mesh_path = asset_mesh_paths[collision_mesh_name]
+        reference_points = scale * _find_ycb_sim_reference_points(object_name)
+        mins = reference_points.min(axis=0)
+        maxs = reference_points.max(axis=0)
+        collision_half_extents = (0.5 * (maxs - mins)).astype(np.float32)
+        collision_size = collision_half_extents.copy()
+    else:
         raise ValueError(
             f"Unsupported YCB_sim collision type '{collision_geom_type}' for '{object_name}'"
         )
-    collision_size = scale * _parse_vector(collision_geom.get("size"), size_length)
+
     collision_pos = scale * _parse_vector(collision_geom.get("pos"), 3)
-    half_extents = _collision_half_extents(collision_geom_type, collision_size)
+    half_extents = collision_half_extents
     mesh_offset = visual_pos - collision_pos
     collision_pos = np.zeros(3, dtype=np.float32)
-    rest_offset_z = float(half_extents[2])
+    rest_offset_z = _compute_rest_offset_z(
+        collision_geom_type, collision_size, collision_pos
+    )
     mass = float(collision_geom.get("mass", "0.15"))
 
     return YCBObjectSpec(
@@ -373,6 +428,7 @@ def _load_ycb_sim_object_spec(
         mass=mass,
         collision_geom_type=collision_geom_type,
         source=YCB_ASSET_SOURCE_YCB_SIM,
+        collision_mesh_path=collision_mesh_path,
     )
 
 
@@ -419,6 +475,7 @@ def create_single_object_ycb_scene(
     root = tree.getroot()
 
     mesh_name = f"mesh_{object_spec.name}"
+    collision_mesh_name = f"mesh_{object_spec.name}_collision"
     material_name = f"material_{object_spec.name}"
     texture_name = f"texture_{object_spec.name}"
     inertia = _stable_inertia(object_spec)
@@ -446,6 +503,19 @@ def create_single_object_ycb_scene(
         "scale",
         _format_vector(np.full(3, object_spec.scale, dtype=np.float32)),
     )
+    collision_mesh = _find_named_asset(asset, "mesh", collision_mesh_name)
+    if object_spec.collision_mesh_path is not None:
+        if collision_mesh is None:
+            collision_mesh = ET.SubElement(asset, "mesh")
+        collision_mesh.attrib.clear()
+        collision_mesh.set("name", collision_mesh_name)
+        collision_mesh.set("file", object_spec.collision_mesh_path.as_posix())
+        collision_mesh.set(
+            "scale",
+            _format_vector(np.full(3, object_spec.scale, dtype=np.float32)),
+        )
+    elif collision_mesh is not None:
+        asset.remove(collision_mesh)
 
     material.set("name", material_name)
     texture = _find_named_asset(asset, "texture", texture_name)
@@ -483,7 +553,12 @@ def create_single_object_ycb_scene(
 
     collision_geom.set("name", f"{object_spec.body_name}_collision")
     collision_geom.set("type", object_spec.collision_geom_type)
-    collision_geom.set("size", _format_vector(object_spec.collision_size))
+    if object_spec.collision_geom_type == "mesh":
+        collision_geom.attrib.pop("size", None)
+        collision_geom.set("mesh", collision_mesh_name)
+    else:
+        collision_geom.attrib.pop("mesh", None)
+        collision_geom.set("size", _format_vector(object_spec.collision_size))
     collision_geom.set("pos", _format_vector(object_spec.collision_pos))
     collision_geom.set("rgba", "0 0 0 0")
     collision_geom.set("contype", _YCB_COLLISION_CONTYPE)

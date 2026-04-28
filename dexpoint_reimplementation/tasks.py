@@ -11,20 +11,28 @@ class ReachingTask:
     NAME = "reaching"
     TARGET_OBJECT = "target_object"
     MAX_EPISODE_STEPS = 150
-    MIDPOINT_DISTANCE_REWARD_SCALE = 1.5
-    EE_DISTANCE_REWARD_SCALE = 0.15
-    EE_DISTANCE_SCALE = 0.20
-    FINGER_DISTANCE_REWARD_SCALE = 1.0
-    FINGER_DISTANCE_SCALE = 0.04
-    FINGER_STANDOFF_MARGIN = 0.01
-    FINGER_BALANCE_REWARD_SCALE = 0.35
-    FINGER_BALANCE_SCALE = 0.05
-    OPEN_REWARD_SCALE = 0.75
-    SUCCESS_DISTANCE_THRESHOLD = 0.025
-    SUCCESS_FINGER_DISTANCE_THRESHOLD = 0.06
-    SUCCESS_OPEN_FRACTION_THRESHOLD = 0.6
+    EE_DISTANCE_REWARD_SCALE = 1.0
+    OPEN_REWARD_SCALE = 0.1
+    ACTION_PENALTY_SCALE = 1e-3
+    SUCCESS_DISTANCE_THRESHOLD = 0.02
+    SUCCESS_OPEN_FRACTION_THRESHOLD = 0.5
+    SUCCESS_HOLD_STEPS = 4
     SUCCESS_BONUS = 2.0
     TIME_PENALTY = 1e-3
+
+    @staticmethod
+    def _update_success_hold_count(env, in_success_pose: bool) -> int:
+        if env.step_count <= 1:
+            env._reaching_success_hold_count = 0
+
+        current_hold_count = int(getattr(env, "_reaching_success_hold_count", 0))
+        if in_success_pose:
+            current_hold_count += 1
+        else:
+            current_hold_count = 0
+
+        env._reaching_success_hold_count = current_hold_count
+        return current_hold_count
 
     @staticmethod
     def get_default_config() -> Dict[str, Any]:
@@ -35,18 +43,12 @@ class ReachingTask:
             "reward_variant": "default",
             "task_name": ReachingTask.NAME,
             "target_body_name": ReachingTask.TARGET_OBJECT,
-            "midpoint_distance_reward_scale": ReachingTask.MIDPOINT_DISTANCE_REWARD_SCALE,
             "ee_distance_reward_scale": ReachingTask.EE_DISTANCE_REWARD_SCALE,
-            "ee_distance_scale": ReachingTask.EE_DISTANCE_SCALE,
-            "finger_distance_reward_scale": ReachingTask.FINGER_DISTANCE_REWARD_SCALE,
-            "finger_distance_scale": ReachingTask.FINGER_DISTANCE_SCALE,
-            "finger_standoff_margin": ReachingTask.FINGER_STANDOFF_MARGIN,
-            "finger_balance_reward_scale": ReachingTask.FINGER_BALANCE_REWARD_SCALE,
-            "finger_balance_scale": ReachingTask.FINGER_BALANCE_SCALE,
             "open_reward_scale": ReachingTask.OPEN_REWARD_SCALE,
+            "action_penalty_scale": ReachingTask.ACTION_PENALTY_SCALE,
             "success_distance_threshold": ReachingTask.SUCCESS_DISTANCE_THRESHOLD,
-            "success_finger_distance_threshold": ReachingTask.SUCCESS_FINGER_DISTANCE_THRESHOLD,
             "success_open_fraction_threshold": ReachingTask.SUCCESS_OPEN_FRACTION_THRESHOLD,
+            "success_hold_steps": ReachingTask.SUCCESS_HOLD_STEPS,
             "success_bonus": ReachingTask.SUCCESS_BONUS,
             "time_penalty": ReachingTask.TIME_PENALTY,
             "terminate_on_target_escape": False,
@@ -58,92 +60,27 @@ class ReachingTask:
 
         target_pos = env.get_target_position()
         ee_pos = env.get_end_effector_position()
-        left_finger_pos = env.get_left_finger_position()
-        right_finger_pos = env.get_right_finger_position()
-        finger_midpoint = env.get_finger_midpoint_position()
 
         ee_distance = float(np.linalg.norm(target_pos - ee_pos))
-        midpoint_distance = float(np.linalg.norm(target_pos - finger_midpoint))
-        left_finger_distance = float(np.linalg.norm(target_pos - left_finger_pos))
-        right_finger_distance = float(np.linalg.norm(target_pos - right_finger_pos))
-        finger_distance = 0.5 * (left_finger_distance + right_finger_distance)
-        finger_balance = float(abs(left_finger_distance - right_finger_distance))
         gripper_open_fraction = env.get_gripper_open_fraction()
-        target_radius = float(np.max(env.target_spec.half_extents[:2]))
-        finger_standoff_margin = float(
-            env.task_config.get(
-                "finger_standoff_margin", ReachingTask.FINGER_STANDOFF_MARGIN
-            )
-        )
-        desired_finger_distance = max(target_radius + finger_standoff_margin, 1e-6)
-        left_finger_distance_error = float(
-            abs(left_finger_distance - desired_finger_distance)
-        )
-        right_finger_distance_error = float(
-            abs(right_finger_distance - desired_finger_distance)
-        )
-        finger_distance_error = 0.5 * (
-            left_finger_distance_error + right_finger_distance_error
-        )
-
-        midpoint_distance_scale = float(
-            env.task_config.get(
-                "midpoint_distance_scale",
-                env.task_config.get(
-                    "ee_distance_scale", ReachingTask.EE_DISTANCE_SCALE
-                ),
-            )
-        )
-        ee_distance_scale = float(
-            env.task_config.get("ee_distance_scale", ReachingTask.EE_DISTANCE_SCALE)
-        )
-        finger_distance_scale = float(
-            env.task_config.get(
-                "finger_distance_scale", ReachingTask.FINGER_DISTANCE_SCALE
-            )
-        )
-        finger_balance_scale = float(
-            env.task_config.get(
-                "finger_balance_scale", ReachingTask.FINGER_BALANCE_SCALE
-            )
-        )
-        midpoint_distance_reward_scale = float(
-            env.task_config.get(
-                "midpoint_distance_reward_scale",
-                ReachingTask.MIDPOINT_DISTANCE_REWARD_SCALE,
-            )
-        )
         ee_distance_reward_scale = float(
             env.task_config.get(
                 "ee_distance_reward_scale",
                 ReachingTask.EE_DISTANCE_REWARD_SCALE,
             )
         )
-        finger_distance_reward_scale = float(
-            env.task_config.get(
-                "finger_distance_reward_scale",
-                ReachingTask.FINGER_DISTANCE_REWARD_SCALE,
-            )
-        )
-        finger_balance_reward_scale = float(
-            env.task_config.get(
-                "finger_balance_reward_scale",
-                ReachingTask.FINGER_BALANCE_REWARD_SCALE,
-            )
-        )
         open_reward_scale = float(
             env.task_config.get("open_reward_scale", ReachingTask.OPEN_REWARD_SCALE)
+        )
+        action_penalty_scale = float(
+            env.task_config.get(
+                "action_penalty_scale", ReachingTask.ACTION_PENALTY_SCALE
+            )
         )
         success_distance_threshold = float(
             env.task_config.get(
                 "success_distance_threshold",
                 ReachingTask.SUCCESS_DISTANCE_THRESHOLD,
-            )
-        )
-        success_finger_distance_threshold = float(
-            env.task_config.get(
-                "success_finger_distance_threshold",
-                ReachingTask.SUCCESS_FINGER_DISTANCE_THRESHOLD,
             )
         )
         success_open_fraction_threshold = float(
@@ -152,6 +89,9 @@ class ReachingTask:
                 ReachingTask.SUCCESS_OPEN_FRACTION_THRESHOLD,
             )
         )
+        success_hold_steps = int(
+            env.task_config.get("success_hold_steps", ReachingTask.SUCCESS_HOLD_STEPS)
+        )
         success_bonus = float(
             env.task_config.get("success_bonus", ReachingTask.SUCCESS_BONUS)
         )
@@ -159,64 +99,36 @@ class ReachingTask:
             env.task_config.get("time_penalty", ReachingTask.TIME_PENALTY)
         )
 
-        midpoint_distance_score = 1.0 - np.tanh(
-            midpoint_distance / max(midpoint_distance_scale, 1e-6)
+        distance_reward = -ee_distance_reward_scale * ee_distance
+        open_reward = open_reward_scale * float(gripper_open_fraction)
+        action = np.asarray(
+            getattr(env, "_last_action", np.zeros(getattr(env, "robot_dof", 8))),
+            dtype=np.float32,
         )
-        ee_distance_score = 1.0 - np.tanh(ee_distance / max(ee_distance_scale, 1e-6))
-        finger_distance_score = 1.0 - np.tanh(
-            finger_distance_error / max(finger_distance_scale, 1e-6)
-        )
-        finger_balance_score = 1.0 - np.tanh(
-            finger_balance / max(finger_balance_scale, 1e-6)
-        )
-        proximity_score = 0.5 * (
-            float(midpoint_distance_score) + float(finger_distance_score)
-        )
-        open_reward_weight = open_reward_scale * (0.25 + 0.75 * proximity_score)
-        open_reward = open_reward_weight * float(gripper_open_fraction)
-        finger_balance_reward = (
-            finger_balance_reward_scale
-            * float(finger_balance_score)
-            * float(midpoint_distance_score)
-        )
+        action_penalty = -action_penalty_scale * float(np.dot(action, action))
 
-        reward = (
-            midpoint_distance_reward_scale * float(midpoint_distance_score)
-            + finger_distance_reward_scale * float(finger_distance_score)
-            + ee_distance_reward_scale * float(ee_distance_score)
-            + float(finger_balance_reward)
-            + float(open_reward)
-            + time_penalty
-        )
-        is_success = bool(
-            midpoint_distance <= success_distance_threshold
-            and finger_distance <= success_finger_distance_threshold
+        reward = distance_reward + float(open_reward) + action_penalty + time_penalty
+        in_success_pose = bool(
+            ee_distance <= success_distance_threshold
             and gripper_open_fraction >= success_open_fraction_threshold
         )
+        success_hold_count = ReachingTask._update_success_hold_count(
+            env, in_success_pose
+        )
+        is_success = bool(in_success_pose and success_hold_count >= success_hold_steps)
         if is_success:
             reward += success_bonus
 
         info.update(
             {
                 "ee_distance": ee_distance,
-                "midpoint_distance": midpoint_distance,
-                "left_finger_distance": left_finger_distance,
-                "right_finger_distance": right_finger_distance,
-                "finger_distance": float(finger_distance),
-                "desired_finger_distance": float(desired_finger_distance),
-                "left_finger_distance_error": float(left_finger_distance_error),
-                "right_finger_distance_error": float(right_finger_distance_error),
-                "finger_distance_error": float(finger_distance_error),
-                "finger_balance": float(finger_balance),
                 "gripper_open_fraction": float(gripper_open_fraction),
-                "open_reward_weight": float(open_reward_weight),
-                "midpoint_distance_score": float(midpoint_distance_score),
-                "ee_distance_score": float(ee_distance_score),
-                "finger_distance_score": float(finger_distance_score),
-                "finger_balance_score": float(finger_balance_score),
-                "finger_balance_reward": float(finger_balance_reward),
+                "in_success_pose": in_success_pose,
+                "success_hold_count": success_hold_count,
+                "success_hold_steps": success_hold_steps,
+                "distance_reward": float(distance_reward),
                 "open_reward": float(open_reward),
-                "time_penalty": time_penalty,
+                "action_penalty": float(action_penalty),
                 "success_bonus": success_bonus if is_success else 0.0,
                 "is_success": is_success,
                 "reward_total": float(reward),
@@ -226,37 +138,460 @@ class ReachingTask:
         return float(reward), is_success, info
 
 
+class LiftingTask:
+    """Simple lifting task for fine-tuning from a reaching checkpoint."""
+
+    NAME = "lifting"
+    TARGET_OBJECT = "target_object"
+    MAX_EPISODE_STEPS = 200
+    TIME_PENALTY = 1e-3
+    CLOSE_REWARD_SCALE = 1.0
+    CLOSE_DISTANCE_THRESHOLD = 0.03
+    TABLE_DISTANCE_REWARD_SCALE = 35.0
+    UNSUPPORTED_AIR_HEIGHT_THRESHOLD = 0.01
+
+    @staticmethod
+    def _update_hold_count(env, attr_name: str, is_active: bool) -> int:
+        if env.step_count <= 1:
+            setattr(env, attr_name, 0)
+
+        current_hold_count = int(getattr(env, attr_name, 0))
+        if is_active:
+            current_hold_count += 1
+        else:
+            current_hold_count = 0
+
+        setattr(env, attr_name, current_hold_count)
+        return current_hold_count
+
+    @staticmethod
+    def _update_bonus_hold_count(env, qualifies_for_bonus: bool) -> int:
+        return LiftingTask._update_hold_count(
+            env,
+            "_lifting_bonus_hold_count",
+            qualifies_for_bonus,
+        )
+
+    @staticmethod
+    def _get_bonus_reward(hold_count: int) -> float:
+        if hold_count <= 0:
+            return 0.0
+        if hold_count == 1:
+            return 0.1
+        if hold_count < 4:
+            return 0.2
+        return 0.4
+
+    @staticmethod
+    def _has_target_table_contact(env) -> bool:
+        for i in range(env.env.data.ncon):
+            contact = env.env.data.contact[i]
+            body1 = env.env.model.geom_bodyid[contact.geom1]
+            body2 = env.env.model.geom_bodyid[contact.geom2]
+            if (body1 == env.target_id and body2 == env.table_body_id) or (
+                body1 == env.table_body_id and body2 == env.target_id
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _compute_shared_reward_terms(
+        env,
+        *,
+        bonus_hold_attr: str,
+        negative_bonus_hold_attr: str,
+    ) -> Dict[str, Any]:
+        close_reward_scale = float(
+            env.task_config.get(
+                "close_reward_scale",
+                LiftingTask.CLOSE_REWARD_SCALE,
+            )
+        )
+        close_distance_threshold = float(
+            env.task_config.get(
+                "close_distance_threshold",
+                LiftingTask.CLOSE_DISTANCE_THRESHOLD,
+            )
+        )
+        unsupported_air_height_threshold = float(
+            env.task_config.get(
+                "unsupported_air_height_threshold",
+                LiftingTask.UNSUPPORTED_AIR_HEIGHT_THRESHOLD,
+            )
+        )
+
+        target_pos = env.get_target_position()
+        ee_pos = env.get_end_effector_position()
+        gripper_can_distance = float(np.linalg.norm(target_pos - ee_pos))
+        gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
+        target_table_distance = float(max(target_pos[2] - env.target_rest_height, 0.0))
+        gripper_open_fraction = float(env.get_gripper_open_fraction())
+        target_table_contact = LiftingTask._has_target_table_contact(env)
+
+        if gripper_can_distance <= close_distance_threshold:
+            close_reward = close_reward_scale * min(
+                1.0 - gripper_open_fraction,
+                0.5,
+            ) + (0.02 * np.abs(gripper_actuator_force))
+            bonus_reward_active = not target_table_contact
+        else:
+            close_reward = 0.01 * gripper_open_fraction
+            bonus_reward_active = False
+
+        bonus_hold_count = LiftingTask._update_hold_count(
+            env,
+            bonus_hold_attr,
+            bonus_reward_active,
+        )
+        bonus_reward = LiftingTask._get_bonus_reward(bonus_hold_count)
+
+        negative_bonus_reward_active = bool(
+            target_table_distance > unsupported_air_height_threshold
+            and gripper_can_distance > close_distance_threshold
+            and not target_table_contact
+        )
+        negative_bonus_hold_count = LiftingTask._update_hold_count(
+            env,
+            negative_bonus_hold_attr,
+            negative_bonus_reward_active,
+        )
+        negative_bonus_reward = -LiftingTask._get_bonus_reward(
+            negative_bonus_hold_count
+        )
+
+        return {
+            "target_table_distance": target_table_distance,
+            "target_table_contact": target_table_contact,
+            "gripper_can_distance": gripper_can_distance,
+            "gripper_actuator_force": gripper_actuator_force,
+            "gripper_open_fraction": gripper_open_fraction,
+            "close_distance_threshold": close_distance_threshold,
+            "unsupported_air_height_threshold": unsupported_air_height_threshold,
+            "close_reward": float(close_reward),
+            "bonus_reward": float(bonus_reward),
+            "bonus_reward_active": bonus_reward_active,
+            "bonus_hold_count": bonus_hold_count,
+            "negative_bonus_reward": float(negative_bonus_reward),
+            "negative_bonus_reward_active": negative_bonus_reward_active,
+            "negative_bonus_hold_count": negative_bonus_hold_count,
+        }
+
+    @staticmethod
+    def get_default_config() -> Dict[str, Any]:
+        return {
+            "max_episode_steps": LiftingTask.MAX_EPISODE_STEPS,
+            "randomize_target_pose": True,
+            "reward_fn": LiftingTask.reward_function,
+            "reward_variant": "default",
+            "task_name": LiftingTask.NAME,
+            "target_body_name": LiftingTask.TARGET_OBJECT,
+            "close_reward_scale": LiftingTask.CLOSE_REWARD_SCALE,
+            "close_distance_threshold": LiftingTask.CLOSE_DISTANCE_THRESHOLD,
+            "table_distance_reward_scale": LiftingTask.TABLE_DISTANCE_REWARD_SCALE,
+            "unsupported_air_height_threshold": LiftingTask.UNSUPPORTED_AIR_HEIGHT_THRESHOLD,
+            "time_penalty": LiftingTask.TIME_PENALTY,
+            "terminate_on_target_escape": False,
+        }
+
+    @staticmethod
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        time_penalty = -float(
+            env.task_config.get("time_penalty", LiftingTask.TIME_PENALTY)
+        )
+        table_distance_reward_scale = float(
+            env.task_config.get(
+                "table_distance_reward_scale",
+                LiftingTask.TABLE_DISTANCE_REWARD_SCALE,
+            )
+        )
+        shared_terms = LiftingTask._compute_shared_reward_terms(
+            env,
+            bonus_hold_attr="_lifting_bonus_hold_count",
+            negative_bonus_hold_attr="_lifting_negative_bonus_hold_count",
+        )
+
+        approach_reward = -shared_terms["gripper_can_distance"]
+        table_distance_reward = (
+            table_distance_reward_scale * shared_terms["target_table_distance"]
+        )
+        reward = (
+            time_penalty
+            + approach_reward
+            + shared_terms["close_reward"]
+            + shared_terms["bonus_reward"]
+            + shared_terms["negative_bonus_reward"]
+            + table_distance_reward
+        )
+
+        info = {
+            "task": LiftingTask.NAME,
+            "step": env.step_count,
+            **shared_terms,
+            "time_penalty": float(time_penalty),
+            "approach_reward": float(approach_reward),
+            "table_distance_reward": float(table_distance_reward),
+            "is_success": False,
+            "reward_total": float(reward),
+        }
+        return float(reward), False, info
+
+
+class PlacingTask:
+    """Lifting task that switches to placement shaping after a successful lift."""
+
+    NAME = "placing"
+    TARGET_OBJECT = LiftingTask.TARGET_OBJECT
+    MAX_EPISODE_STEPS = LiftingTask.MAX_EPISODE_STEPS
+    LIFT_PHASE_COMPLETE_HEIGHT = 0.15
+    POST_LIFT_DISTANCE_PENALTY_SCALE = 1.0
+    POST_LIFT_TABLE_CONTACT_REWARD = 0.05
+    OFF_TABLE_PENALTY_SCALE = 10.0
+    CAN_FALL_THRESHOLD = 0.03
+
+    @staticmethod
+    def _update_post_lift_phase(env, target_table_distance: float) -> bool:
+        if env.step_count <= 1:
+            env._placing_post_lift_phase = False
+
+        has_reached_post_lift_phase = bool(
+            getattr(env, "_placing_post_lift_phase", False)
+        )
+        lift_phase_complete_height = float(
+            env.task_config.get(
+                "lift_phase_complete_height",
+                PlacingTask.LIFT_PHASE_COMPLETE_HEIGHT,
+            )
+        )
+        if target_table_distance >= lift_phase_complete_height:
+            has_reached_post_lift_phase = True
+
+        env._placing_post_lift_phase = has_reached_post_lift_phase
+        return has_reached_post_lift_phase
+
+    @staticmethod
+    def get_default_config() -> Dict[str, Any]:
+        return {
+            "max_episode_steps": PlacingTask.MAX_EPISODE_STEPS,
+            "randomize_target_pose": True,
+            "reward_fn": PlacingTask.reward_function,
+            "reward_variant": "default",
+            "task_name": PlacingTask.NAME,
+            "target_body_name": PlacingTask.TARGET_OBJECT,
+            "close_reward_scale": LiftingTask.CLOSE_REWARD_SCALE,
+            "close_distance_threshold": LiftingTask.CLOSE_DISTANCE_THRESHOLD,
+            "table_distance_reward_scale": LiftingTask.TABLE_DISTANCE_REWARD_SCALE,
+            "unsupported_air_height_threshold": LiftingTask.UNSUPPORTED_AIR_HEIGHT_THRESHOLD,
+            "time_penalty": LiftingTask.TIME_PENALTY,
+            "lift_phase_complete_height": PlacingTask.LIFT_PHASE_COMPLETE_HEIGHT,
+            "post_lift_distance_penalty_scale": PlacingTask.POST_LIFT_DISTANCE_PENALTY_SCALE,
+            "post_lift_table_contact_reward": PlacingTask.POST_LIFT_TABLE_CONTACT_REWARD,
+            "terminate_on_target_escape": False,
+            "off_table_penalty_scale": PlacingTask.OFF_TABLE_PENALTY_SCALE,
+            "terminate_on_can_fall": True,
+            "can_fall_threshold": PlacingTask.CAN_FALL_THRESHOLD,
+        }
+
+    @staticmethod
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        time_penalty = -float(
+            env.task_config.get("time_penalty", LiftingTask.TIME_PENALTY)
+        )
+        table_distance_reward_scale = float(
+            env.task_config.get(
+                "table_distance_reward_scale",
+                LiftingTask.TABLE_DISTANCE_REWARD_SCALE,
+            )
+        )
+        post_lift_distance_penalty_scale = float(
+            env.task_config.get(
+                "post_lift_distance_penalty_scale",
+                PlacingTask.POST_LIFT_DISTANCE_PENALTY_SCALE,
+            )
+        )
+        post_lift_table_contact_reward = float(
+            env.task_config.get(
+                "post_lift_table_contact_reward",
+                PlacingTask.POST_LIFT_TABLE_CONTACT_REWARD,
+            )
+        )
+        off_table_penalty_scale = float(
+            env.task_config.get(
+                "off_table_penalty_scale",
+                PlacingTask.OFF_TABLE_PENALTY_SCALE,
+            )
+        )
+        terminate_on_can_fall = bool(env.task_config.get("terminate_on_can_fall", True))
+        can_fall_threshold = float(
+            env.task_config.get("can_fall_threshold", PlacingTask.CAN_FALL_THRESHOLD)
+        )
+        shared_terms = LiftingTask._compute_shared_reward_terms(
+            env,
+            bonus_hold_attr="_placing_bonus_hold_count",
+            negative_bonus_hold_attr="_placing_negative_bonus_hold_count",
+        )
+
+        post_lift_phase_active = PlacingTask._update_post_lift_phase(
+            env,
+            shared_terms["target_table_distance"],
+        )
+        approach_reward = -shared_terms["gripper_can_distance"]
+
+        if post_lift_phase_active:
+            bonus_reward = 0.0
+            bonus_reward_active = False
+            table_distance_reward = 0.0
+            post_lift_distance_penalty = (
+                -post_lift_distance_penalty_scale
+                * shared_terms["target_table_distance"]
+            )
+            table_contact_reward = (
+                post_lift_table_contact_reward
+                if shared_terms["target_table_contact"]
+                else 0.0
+            )
+        else:
+            bonus_reward = shared_terms["bonus_reward"]
+            bonus_reward_active = shared_terms["bonus_reward_active"]
+            table_distance_reward = (
+                table_distance_reward_scale * shared_terms["target_table_distance"]
+            )
+            post_lift_distance_penalty = 0.0
+            table_contact_reward = 0.0
+
+        # Penalise (and optionally terminate) when the can has fallen below the
+        # table surface.  target_table_distance clips at 0 so it cannot detect
+        # this case; we must read target_pos directly.
+        target_pos = env.get_target_position()
+        can_below_table = bool(
+            target_pos[2] < env.target_rest_height - can_fall_threshold
+        )
+        off_table_penalty = -off_table_penalty_scale if can_below_table else 0.0
+        done = terminate_on_can_fall and can_below_table
+
+        reward = (
+            time_penalty
+            + approach_reward
+            + shared_terms["close_reward"]
+            + bonus_reward
+            + shared_terms["negative_bonus_reward"]
+            + table_distance_reward
+            + post_lift_distance_penalty
+            + table_contact_reward
+            + off_table_penalty
+        )
+
+        info = {
+            "task": PlacingTask.NAME,
+            "step": env.step_count,
+            **shared_terms,
+            "bonus_reward": float(bonus_reward),
+            "bonus_reward_active": bonus_reward_active,
+            "time_penalty": float(time_penalty),
+            "approach_reward": float(approach_reward),
+            "table_distance_reward": float(table_distance_reward),
+            "post_lift_phase_active": post_lift_phase_active,
+            "lift_phase_complete_height": float(
+                env.task_config.get(
+                    "lift_phase_complete_height",
+                    PlacingTask.LIFT_PHASE_COMPLETE_HEIGHT,
+                )
+            ),
+            "post_lift_distance_penalty": float(post_lift_distance_penalty),
+            "table_contact_reward": float(table_contact_reward),
+            "can_below_table": can_below_table,
+            "off_table_penalty": float(off_table_penalty),
+            "is_success": False,
+            "reward_total": float(reward),
+        }
+        return float(reward), done, info
+
+
+class LiftingOnlyTask:
+    """Pure lifting task with no reach or grasp shaping rewards."""
+
+    NAME = "lifting_only"
+    TARGET_OBJECT = LiftingTask.TARGET_OBJECT
+    MAX_EPISODE_STEPS = LiftingTask.MAX_EPISODE_STEPS
+
+    @staticmethod
+    def get_default_config() -> Dict[str, Any]:
+        return {
+            "max_episode_steps": LiftingOnlyTask.MAX_EPISODE_STEPS,
+            "randomize_target_pose": True,
+            "reward_fn": LiftingOnlyTask.reward_function,
+            "reward_variant": "default",
+            "task_name": LiftingOnlyTask.NAME,
+            "target_body_name": LiftingOnlyTask.TARGET_OBJECT,
+            "terminate_on_target_escape": False,
+        }
+
+    @staticmethod
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        time_penalty = -1e-3
+        close_distance_threshold = 0.03
+
+        target_pos = env.get_target_position()
+        ee_pos = env.get_end_effector_position()
+        gripper_can_distance = float(np.linalg.norm(target_pos - ee_pos))
+        gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
+        target_table_distance = float(max(target_pos[2] - env.target_rest_height, 0.0))
+        gripper_open_fraction = float(env.get_gripper_open_fraction())
+
+        bonus_reward_active = False
+        if gripper_can_distance <= close_distance_threshold:
+            bonus_reward_active = True
+            for i in range(env.env.data.ncon):
+                contact = env.env.data.contact[i]
+                body1 = env.env.model.geom_bodyid[contact.geom1]
+                body2 = env.env.model.geom_bodyid[contact.geom2]
+                if (body1 == env.target_id and body2 == env.table_body_id) or (
+                    body1 == env.table_body_id and body2 == env.target_id
+                ):
+                    bonus_reward_active = False
+                    break
+
+        bonus_hold_count = LiftingTask._update_bonus_hold_count(
+            env, bonus_reward_active
+        )
+        bonus_reward = LiftingTask._get_bonus_reward(bonus_hold_count)
+
+        reward = time_penalty + (400 * (target_table_distance**2)) + bonus_reward
+
+        info = {
+            "task": LiftingOnlyTask.NAME,
+            "step": env.step_count,
+            "target_table_distance": target_table_distance,
+            "gripper_can_distance": gripper_can_distance,
+            "gripper_actuator_force": gripper_actuator_force,
+            "gripper_open_fraction": gripper_open_fraction,
+            "bonus_reward": float(bonus_reward),
+            "bonus_reward_active": bonus_reward_active,
+            "bonus_hold_count": bonus_hold_count,
+            "close_reward": 0.0,
+            "time_penalty": time_penalty,
+            "reward_total": float(reward),
+        }
+        return float(reward), False, info
+
+
 class GraspingTask:
     """Object grasping task configuration."""
 
     NAME = "grasping"
     TARGET_OBJECT = "target_object"
-    DISTANCE_REWARD_SCALE = 0.75
-    DISTANCE_SCALE = 0.25
-    ORIENTATION_REWARD_SCALE = 0.2
-    ORIENTATION_THRESHOLD = 0.90
-    GRASP_REWARD_SCALE = 2.50
-    CAGING_DISTANCE = 0.08
-    GRASP_ACTUATOR_FORCE_THRESHOLD = 2.0
-    GRASP_ACTUATOR_FORCE_SCALE = 8.0
-    GRASP_WIDTH_TOLERANCE = 0.012
-    LIFT_REWARD_SCALE = 2.0
-    LIFT_CLEARANCE = 0.01
-    LIFT_HEIGHT_THRESHOLD = 0.08
-    GOAL_HEIGHT_REWARD_SCALE = 1.0
-    GOAL_HEIGHT_TOLERANCE = 0.08
-    SUCCESS_GOAL_HEIGHT_THRESHOLD = 0.02
     SUCCESS_BONUS = 0.5
     TIME_PENALTY = 1e-3
     FAILURE_PENALTY = -1.0
     FAILURE_XY_MARGIN = 0.05
     FAILURE_Z_MARGIN = 0.01
-    GRASP_SHAPING_START_STEP = 0
-    GRASP_SHAPING_FULL_STEP = 2_000_000
-    GOAL_REWARD_START_STEP = 10_000_000
-    GOAL_REWARD_FULL_STEP = 12_000_000
-    GOAL_REWARD_START_UPDATE = 4_000
-    GOAL_REWARD_FULL_UPDATE = 4_800
+    REACHING_ONLY_END_STEP = 300_000
+    CLOSE_REWARD_FULL_STEP = 1_000_000
+    LIFTING_BLEND_FULL_STEP = 2_000_000
+    CLOSE_REWARD_DECAY_END_STEP = 10_000_000
+    BONUS_REWARD_FULL_BOOST_STEP = 14_000_000
+    TABLE_DISTANCE_FULL_BOOST_STEP = 14_000_000
+    MAX_BONUS_WEIGHT = 2.0
+    MAX_TABLE_DISTANCE_WEIGHT = 2.0
 
     @staticmethod
     def _safe_progress_ratio(current: float, start: float, end: float) -> float:
@@ -282,621 +617,414 @@ class GraspingTask:
         return num_timesteps, n_updates
 
     @staticmethod
-    def _compute_reward_features(env) -> Dict[str, Any]:
-        target_pos = env.get_target_position() + np.array([0.0, 0.0, 0.01])
-        goal_pos = env.goal_position
+    def _compute_reaching_terms(env) -> Dict[str, Any]:
+        target_pos = env.get_target_position()
         ee_pos = env.get_end_effector_position()
-        finger_midpoint = env.get_finger_midpoint_position()
-        lfinger_pos = env.get_left_finger_position()
-        rfinger_pos = env.get_right_finger_position()
-        gripper_opening_width = env.get_gripper_opening_width()
-        gripper_open_fraction = env.get_gripper_open_fraction()
-        gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
-        target_contact_score = env.get_gripper_target_contact_score()
-        orientation_down_alignment = env.get_end_effector_down_alignment()
 
-        distance_scale = float(
-            env.task_config.get("distance_scale", GraspingTask.DISTANCE_SCALE)
-        )
-        orientation_threshold = float(
+        ee_distance = float(np.linalg.norm(target_pos - ee_pos))
+        gripper_open_fraction = float(env.get_gripper_open_fraction())
+        ee_distance_reward_scale = float(
             env.task_config.get(
-                "orientation_threshold", GraspingTask.ORIENTATION_THRESHOLD
+                "ee_distance_reward_scale",
+                ReachingTask.EE_DISTANCE_REWARD_SCALE,
             )
         )
-        caging_distance = float(
-            env.task_config.get("caging_distance", GraspingTask.CAGING_DISTANCE)
+        open_reward_scale = float(
+            env.task_config.get("open_reward_scale", ReachingTask.OPEN_REWARD_SCALE)
         )
-        force_threshold = float(
+        action_penalty_scale = float(
             env.task_config.get(
-                "grasp_actuator_force_threshold",
-                GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
+                "action_penalty_scale", ReachingTask.ACTION_PENALTY_SCALE
             )
         )
-        force_scale = float(
+        success_distance_threshold = float(
             env.task_config.get(
-                "grasp_actuator_force_scale", GraspingTask.GRASP_ACTUATOR_FORCE_SCALE
+                "success_distance_threshold",
+                ReachingTask.SUCCESS_DISTANCE_THRESHOLD,
             )
         )
-        grasp_width_tolerance = float(
+        success_open_fraction_threshold = float(
             env.task_config.get(
-                "grasp_width_tolerance", GraspingTask.GRASP_WIDTH_TOLERANCE
+                "success_open_fraction_threshold",
+                ReachingTask.SUCCESS_OPEN_FRACTION_THRESHOLD,
             )
         )
-        lift_clearance = float(
-            env.task_config.get("lift_clearance", GraspingTask.LIFT_CLEARANCE)
+        success_hold_steps = int(
+            env.task_config.get("success_hold_steps", ReachingTask.SUCCESS_HOLD_STEPS)
         )
-        lift_height_threshold = float(
-            env.task_config.get(
-                "lift_height_threshold", GraspingTask.LIFT_HEIGHT_THRESHOLD
-            )
+        success_bonus = float(
+            env.task_config.get("reaching_success_bonus", ReachingTask.SUCCESS_BONUS)
         )
-        goal_height_tolerance = float(
-            env.task_config.get(
-                "goal_height_tolerance", GraspingTask.GOAL_HEIGHT_TOLERANCE
-            )
-        )
-        success_goal_height_threshold = float(
-            env.task_config.get(
-                "success_goal_height_threshold",
-                GraspingTask.SUCCESS_GOAL_HEIGHT_THRESHOLD,
-            )
+        time_penalty = -float(
+            env.task_config.get("time_penalty", ReachingTask.TIME_PENALTY)
         )
 
-        reach_distance = float(np.linalg.norm(target_pos - finger_midpoint))
-        ee_object_distance = float(np.linalg.norm(target_pos - ee_pos))
-        ee_target_xy_distance = float(np.linalg.norm(ee_pos[:2] - target_pos[:2]))
-        ee_target_z_distance = float(abs(ee_pos[2] - target_pos[2]))
-        goal_distance = float(np.linalg.norm(target_pos - goal_pos))
-        goal_xy_distance = float(np.linalg.norm(target_pos[:2] - goal_pos[:2]))
-        goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
-        lfinger_dist = float(np.linalg.norm(lfinger_pos - target_pos))
-        rfinger_dist = float(np.linalg.norm(rfinger_pos - target_pos))
-        finger_dist = 0.5 * (lfinger_dist + rfinger_dist)
-        target_height_above_table = float(target_pos[2] - env.table_height)
-        target_lift = float(target_pos[2] - env.target_rest_height)
-
-        distance_score = 1.0 - np.tanh(reach_distance / max(distance_scale, 1e-6))
-        finger_score = 1.0 - np.tanh(finger_dist / max(distance_scale, 1e-6))
-        orientation_score = np.clip(
-            (orientation_down_alignment - orientation_threshold)
-            / max(1.0 - orientation_threshold, 1e-6),
-            0.0,
-            1.0,
+        distance_reward = -ee_distance_reward_scale * ee_distance
+        open_reward = open_reward_scale * gripper_open_fraction
+        action = np.asarray(
+            getattr(env, "_last_action", np.zeros(getattr(env, "robot_dof", 8))),
+            dtype=np.float32,
         )
-        caging_score = max(
-            1.0 - np.tanh(reach_distance / max(caging_distance, 1e-6)),
-            1.0 - np.tanh(finger_dist / max(0.75 * caging_distance, 1e-6)),
+        action_penalty = -action_penalty_scale * float(np.dot(action, action))
+        in_success_pose = bool(
+            ee_distance <= success_distance_threshold
+            and gripper_open_fraction >= success_open_fraction_threshold
         )
-        force_score = np.clip(
-            (gripper_actuator_force - force_threshold) / max(force_scale, 1e-6),
-            0.0,
-            1.0,
+        success_hold_count = ReachingTask._update_success_hold_count(
+            env, in_success_pose
         )
-        expected_grasp_width = 2.0 * float(np.max(env.target_spec.half_extents[:2]))
-        width_match_score = np.clip(
-            1.0
-            - abs(gripper_opening_width - expected_grasp_width)
-            / max(grasp_width_tolerance, 1e-6),
-            0.0,
-            1.0,
-        )
-        contact_grasp_score = np.clip(float(target_contact_score), 0.0, 1.0)
-        force_grasp_score = force_score * max(width_match_score, 0.25)
-        enclosure_score = np.clip(0.5 * (finger_score + caging_score), 0.0, 1.0)
-        grasp_evidence_score = max(
-            float(contact_grasp_score),
-            float(force_grasp_score),
-            float(enclosure_score * width_match_score),
-        )
-        grasp_score = np.clip(
-            0.35 * enclosure_score
-            + 0.25 * orientation_score
-            + 0.20 * contact_grasp_score
-            + 0.20 * force_grasp_score,
-            0.0,
-            1.0,
-        )
-        lift_progress = np.clip(
-            (target_lift - lift_clearance)
-            / max(lift_height_threshold - lift_clearance, 1e-6),
-            0.0,
-            1.0,
-        )
-        goal_height_score = np.clip(
-            1.0 - goal_z_distance / max(goal_height_tolerance, 1e-6),
-            0.0,
-            1.0,
-        )
-        target_between_fingers = bool(
-            enclosure_score > 0.55 and width_match_score > 0.15
-        )
-        grasp_detected = bool(
-            grasp_evidence_score > 0.35
-            and (caging_score > 0.35 or target_contact_score >= 1.0)
-        )
-        is_success = bool(
-            target_lift >= lift_height_threshold
-            and goal_z_distance <= success_goal_height_threshold
+        is_success = bool(in_success_pose and success_hold_count >= success_hold_steps)
+        success_bonus_value = success_bonus if is_success else 0.0
+        reward_total = (
+            distance_reward
+            + open_reward
+            + action_penalty
+            + time_penalty
+            + success_bonus_value
         )
 
         return {
-            "reach_distance": reach_distance,
-            "ee_object_distance": ee_object_distance,
-            "ee_target_xy_distance": ee_target_xy_distance,
-            "ee_target_z_distance": ee_target_z_distance,
-            "goal_distance": goal_distance,
-            "goal_xy_distance": goal_xy_distance,
-            "goal_z_distance": goal_z_distance,
-            "goal_height_distance": goal_z_distance,
-            "lfinger_dist": lfinger_dist,
-            "rfinger_dist": rfinger_dist,
-            "finger_dist": finger_dist,
-            "gripper_opening_width": gripper_opening_width,
+            "ee_distance": ee_distance,
             "gripper_open_fraction": gripper_open_fraction,
-            "gripper_actuator_force": gripper_actuator_force,
-            "target_contact_score": float(target_contact_score),
-            "target_height_above_table": target_height_above_table,
-            "target_lift": target_lift,
-            "orientation_down_alignment": orientation_down_alignment,
-            "distance_score": float(distance_score),
-            "finger_score": float(finger_score),
-            "orientation_score": float(orientation_score),
-            "caging_score": float(caging_score),
-            "force_score": float(force_score),
-            "width_match_score": float(width_match_score),
-            "contact_grasp_score": float(contact_grasp_score),
-            "force_grasp_score": float(force_grasp_score),
-            "enclosure_score": float(enclosure_score),
-            "grasp_evidence_score": float(grasp_evidence_score),
-            "grasp_score": float(grasp_score),
-            "lift_progress": float(lift_progress),
-            "goal_height_score": float(goal_height_score),
-            "target_between_fingers": target_between_fingers,
-            "grasp_detected": grasp_detected,
+            "in_success_pose": in_success_pose,
+            "success_hold_count": success_hold_count,
+            "success_hold_steps": success_hold_steps,
+            "distance_reward": float(distance_reward),
+            "open_reward": float(open_reward),
+            "action_penalty": float(action_penalty),
+            "time_penalty": float(time_penalty),
+            "success_bonus": float(success_bonus_value),
             "is_success": is_success,
+            "reward_total": float(reward_total),
+        }
+
+    @staticmethod
+    def _compute_lifting_terms(env) -> Dict[str, Any]:
+        target_pos = env.get_target_position()
+        ee_pos = env.get_end_effector_position()
+        gripper_can_distance = float(np.linalg.norm(target_pos - ee_pos))
+        gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
+        target_table_distance = float(max(target_pos[2] - env.target_rest_height, 0.0))
+        gripper_open_fraction = float(env.get_gripper_open_fraction())
+
+        close_distance_threshold = float(
+            env.task_config.get("close_distance_threshold", 0.03)
+        )
+        close_reward_scale = float(env.task_config.get("close_reward_scale", 1.0))
+        approach_reward_scale = float(env.task_config.get("approach_reward_scale", 1.0))
+        table_distance_reward_scale = float(
+            env.task_config.get("table_distance_reward_scale", 40.0)
+        )
+
+        time_penalty = -float(
+            env.task_config.get("lifting_time_penalty", GraspingTask.TIME_PENALTY)
+        )
+
+        bonus_reward_active = False
+        if gripper_can_distance <= close_distance_threshold:
+            close_reward = close_reward_scale * min(
+                1.0 - gripper_open_fraction, 0.5
+            ) + (0.02 * np.abs(gripper_actuator_force))
+            bonus_reward_active = True
+            for i in range(env.env.data.ncon):
+                contact = env.env.data.contact[i]
+                body1 = env.env.model.geom_bodyid[contact.geom1]
+                body2 = env.env.model.geom_bodyid[contact.geom2]
+                if (body1 == env.target_id and body2 == env.table_body_id) or (
+                    body1 == env.table_body_id and body2 == env.target_id
+                ):
+                    bonus_reward_active = False
+                    break
+        else:
+            close_reward = 0.01 * gripper_open_fraction
+
+        bonus_hold_count = LiftingTask._update_bonus_hold_count(
+            env, bonus_reward_active
+        )
+        bonus_reward = LiftingTask._get_bonus_reward(bonus_hold_count)
+        approach_reward = -approach_reward_scale * gripper_can_distance
+        table_distance_reward = table_distance_reward_scale * target_table_distance
+        reward_total = (
+            time_penalty
+            + approach_reward
+            + float(close_reward)
+            + float(bonus_reward)
+            + table_distance_reward
+        )
+
+        return {
+            "gripper_can_distance": gripper_can_distance,
+            "gripper_actuator_force": gripper_actuator_force,
+            "gripper_open_fraction": gripper_open_fraction,
+            "target_table_distance": target_table_distance,
+            "bonus_reward_active": bonus_reward_active,
+            "bonus_hold_count": bonus_hold_count,
+            "close_reward": float(close_reward),
+            "bonus_reward": float(bonus_reward),
+            "approach_reward": float(approach_reward),
+            "table_distance_reward": float(table_distance_reward),
+            "time_penalty": float(time_penalty),
+            "reward_total": float(reward_total),
+        }
+
+    @staticmethod
+    def _get_curriculum_weights(env, num_timesteps: float) -> Dict[str, float]:
+        reaching_only_end_step = float(
+            env.task_config.get(
+                "reaching_only_end_step", GraspingTask.REACHING_ONLY_END_STEP
+            )
+        )
+        close_reward_full_step = float(
+            env.task_config.get(
+                "close_reward_full_step", GraspingTask.CLOSE_REWARD_FULL_STEP
+            )
+        )
+        lifting_blend_full_step = float(
+            env.task_config.get(
+                "lifting_blend_full_step", GraspingTask.LIFTING_BLEND_FULL_STEP
+            )
+        )
+        close_reward_decay_end_step = float(
+            env.task_config.get(
+                "close_reward_decay_end_step",
+                GraspingTask.CLOSE_REWARD_DECAY_END_STEP,
+            )
+        )
+        bonus_reward_full_boost_step = float(
+            env.task_config.get(
+                "bonus_reward_full_boost_step",
+                GraspingTask.BONUS_REWARD_FULL_BOOST_STEP,
+            )
+        )
+        table_distance_full_boost_step = float(
+            env.task_config.get(
+                "table_distance_full_boost_step",
+                GraspingTask.TABLE_DISTANCE_FULL_BOOST_STEP,
+            )
+        )
+        max_bonus_weight = float(
+            env.task_config.get("max_bonus_weight", GraspingTask.MAX_BONUS_WEIGHT)
+        )
+        max_table_distance_weight = float(
+            env.task_config.get(
+                "max_table_distance_weight",
+                GraspingTask.MAX_TABLE_DISTANCE_WEIGHT,
+            )
+        )
+
+        close_phase_weight = GraspingTask._safe_progress_ratio(
+            num_timesteps,
+            reaching_only_end_step,
+            close_reward_full_step,
+        )
+        lifting_weight = GraspingTask._safe_progress_ratio(
+            num_timesteps,
+            close_reward_full_step,
+            lifting_blend_full_step,
+        )
+
+        if num_timesteps < close_reward_full_step:
+            reaching_weight = 1.0
+            close_weight = close_phase_weight
+        elif num_timesteps < lifting_blend_full_step:
+            reaching_weight = 1.0 - lifting_weight
+            close_weight = 1.0
+        else:
+            reaching_weight = 0.0
+            close_weight = 1.0 - GraspingTask._safe_progress_ratio(
+                num_timesteps,
+                lifting_blend_full_step,
+                close_reward_decay_end_step,
+            )
+
+        if num_timesteps < lifting_blend_full_step:
+            bonus_weight = lifting_weight
+            table_distance_weight = lifting_weight
+        else:
+            bonus_weight = 1.0 + (
+                max_bonus_weight - 1.0
+            ) * GraspingTask._safe_progress_ratio(
+                num_timesteps,
+                lifting_blend_full_step,
+                bonus_reward_full_boost_step,
+            )
+            table_distance_weight = 1.0 + (
+                max_table_distance_weight - 1.0
+            ) * GraspingTask._safe_progress_ratio(
+                num_timesteps,
+                lifting_blend_full_step,
+                table_distance_full_boost_step,
+            )
+
+        if num_timesteps < reaching_only_end_step:
+            curriculum_phase = "reaching"
+            curriculum_phase_index = 0.0
+        elif num_timesteps < close_reward_full_step:
+            curriculum_phase = "reach_plus_close"
+            curriculum_phase_index = 1.0
+        elif num_timesteps < lifting_blend_full_step:
+            curriculum_phase = "blend_to_lifting"
+            curriculum_phase_index = 2.0
+        else:
+            curriculum_phase = "lift_dominant"
+            curriculum_phase_index = 3.0
+
+        return {
+            "curriculum_phase": curriculum_phase,
+            "curriculum_phase_index": float(curriculum_phase_index),
+            "reaching_weight": float(reaching_weight),
+            "close_phase_weight": float(close_phase_weight),
+            "lifting_weight": float(lifting_weight),
+            "close_weight": float(close_weight),
+            "bonus_weight": float(bonus_weight),
+            "table_distance_weight": float(table_distance_weight),
+        }
+
+    @staticmethod
+    def _blend_reward_terms(
+        reaching_terms: Dict[str, Any],
+        lifting_terms: Dict[str, Any],
+        weights: Dict[str, float],
+    ) -> Dict[str, float]:
+        reaching_weight = weights["reaching_weight"]
+        lifting_weight = weights["lifting_weight"]
+
+        reaching_reward = reaching_weight * reaching_terms["reward_total"]
+        close_reward_component = weights["close_weight"] * lifting_terms["close_reward"]
+        approach_reward_component = lifting_weight * lifting_terms["approach_reward"]
+        bonus_reward_component = weights["bonus_weight"] * lifting_terms["bonus_reward"]
+        target_table_distance_component = (
+            weights["table_distance_weight"] * lifting_terms["table_distance_reward"]
+        )
+        lifting_time_penalty_component = lifting_weight * lifting_terms["time_penalty"]
+        lifting_reward = (
+            close_reward_component
+            + approach_reward_component
+            + bonus_reward_component
+            + target_table_distance_component
+            + lifting_time_penalty_component
+        )
+
+        return {
+            "reaching_reward": float(reaching_reward),
+            "lifting_reward": float(lifting_reward),
+            "reaching_distance_reward": float(
+                reaching_weight * reaching_terms["distance_reward"]
+            ),
+            "reaching_open_reward": float(
+                reaching_weight * reaching_terms["open_reward"]
+            ),
+            "reaching_action_penalty": float(
+                reaching_weight * reaching_terms["action_penalty"]
+            ),
+            "reaching_time_penalty": float(
+                reaching_weight * reaching_terms["time_penalty"]
+            ),
+            "reaching_success_bonus": float(
+                reaching_weight * reaching_terms["success_bonus"]
+            ),
+            "close_reward_component": float(close_reward_component),
+            "bonus_reward_component": float(bonus_reward_component),
+            "approach_reward_component": float(approach_reward_component),
+            "target_table_distance_component": float(target_table_distance_component),
+            "lifting_time_penalty_component": float(lifting_time_penalty_component),
+            "time_penalty": float(
+                reaching_weight * reaching_terms["time_penalty"]
+                + lifting_time_penalty_component
+            ),
+            "reward_total": float(reaching_reward + lifting_reward),
         }
 
     @staticmethod
     def get_default_config() -> Dict[str, Any]:
         """Get default task configuration."""
         return {
-            "max_episode_steps": 800,
+            "max_episode_steps": 200,
             "randomize_target_pose": True,
             "reward_fn": GraspingTask.reward_function_shaped,
             "reward_variant": "shaped",
             "task_name": GraspingTask.NAME,
             "target_body_name": GraspingTask.TARGET_OBJECT,
-            "distance_reward_scale": GraspingTask.DISTANCE_REWARD_SCALE,
-            "distance_scale": GraspingTask.DISTANCE_SCALE,
-            "orientation_reward_scale": GraspingTask.ORIENTATION_REWARD_SCALE,
-            "orientation_threshold": GraspingTask.ORIENTATION_THRESHOLD,
-            "grasp_reward_scale": GraspingTask.GRASP_REWARD_SCALE,
-            "caging_distance": GraspingTask.CAGING_DISTANCE,
-            "grasp_actuator_force_threshold": GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
-            "grasp_actuator_force_scale": GraspingTask.GRASP_ACTUATOR_FORCE_SCALE,
-            "grasp_width_tolerance": GraspingTask.GRASP_WIDTH_TOLERANCE,
-            "lift_reward_scale": GraspingTask.LIFT_REWARD_SCALE,
-            "lift_clearance": GraspingTask.LIFT_CLEARANCE,
-            "lift_height_threshold": GraspingTask.LIFT_HEIGHT_THRESHOLD,
-            "goal_height_reward_scale": GraspingTask.GOAL_HEIGHT_REWARD_SCALE,
-            "goal_height_tolerance": GraspingTask.GOAL_HEIGHT_TOLERANCE,
-            "success_goal_height_threshold": GraspingTask.SUCCESS_GOAL_HEIGHT_THRESHOLD,
-            "success_bonus": GraspingTask.SUCCESS_BONUS,
+            "success_bonus": 0.0,
             "time_penalty": GraspingTask.TIME_PENALTY,
             "failure_penalty": GraspingTask.FAILURE_PENALTY,
             "failure_xy_margin": GraspingTask.FAILURE_XY_MARGIN,
             "failure_z_margin": GraspingTask.FAILURE_Z_MARGIN,
-            "grasp_shaping_start_step": GraspingTask.GRASP_SHAPING_START_STEP,
-            "grasp_shaping_full_step": GraspingTask.GRASP_SHAPING_FULL_STEP,
-            "goal_reward_start_step": GraspingTask.GOAL_REWARD_START_STEP,
-            "goal_reward_full_step": GraspingTask.GOAL_REWARD_FULL_STEP,
-            "goal_reward_start_update": GraspingTask.GOAL_REWARD_START_UPDATE,
-            "goal_reward_full_update": GraspingTask.GOAL_REWARD_FULL_UPDATE,
+            "reaching_only_end_step": GraspingTask.REACHING_ONLY_END_STEP,
+            "close_reward_full_step": GraspingTask.CLOSE_REWARD_FULL_STEP,
+            "lifting_blend_full_step": GraspingTask.LIFTING_BLEND_FULL_STEP,
+            "close_reward_decay_end_step": GraspingTask.CLOSE_REWARD_DECAY_END_STEP,
+            "bonus_reward_full_boost_step": GraspingTask.BONUS_REWARD_FULL_BOOST_STEP,
+            "table_distance_full_boost_step": GraspingTask.TABLE_DISTANCE_FULL_BOOST_STEP,
+            "max_bonus_weight": GraspingTask.MAX_BONUS_WEIGHT,
+            "max_table_distance_weight": GraspingTask.MAX_TABLE_DISTANCE_WEIGHT,
+            "close_distance_threshold": 0.03,
+            "close_reward_scale": 1.0,
+            "approach_reward_scale": 1.0,
+            "table_distance_reward_scale": 40.0,
+            "lifting_time_penalty": GraspingTask.TIME_PENALTY,
         }
-
-    # @staticmethod
-    # def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
-    #     reward = 0.0
-    #     done = False
-    #     info = {"task": GraspingTask.NAME, "step": env.step_count}
-
-    #     target_pos = env.get_target_position() + np.array(
-    #         [0.0, 0.0, 0.01]
-    #     )  # Slightly above target center for better grasping
-    #     goal_pos = env.goal_position
-    #     ee_pos = env.get_end_effector_position()
-    #     finger_midpoint = env.get_finger_midpoint_position()
-    #     gripper_opening_width = env.get_gripper_opening_width()
-    #     gripper_open_fraction = env.get_gripper_open_fraction()
-    #     gripper_actuator_force = float(abs(env.get_gripper_actuator_force()))
-    #     target_contact_score = env.get_gripper_target_contact_score()
-    #     reach_distance = float(np.linalg.norm(target_pos - finger_midpoint))
-    #     ee_target_xy_distance = float(np.linalg.norm(ee_pos[:2] - target_pos[:2]))
-    #     ee_target_z_distance = float(abs(ee_pos[2] - target_pos[2]))
-    #     goal_distance = float(np.linalg.norm(target_pos - goal_pos))
-    #     goal_xy_distance = float(np.linalg.norm(target_pos[:2] - goal_pos[:2]))
-    #     goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
-    #     target_height_above_table = float(target_pos[2] - env.table_height)
-    #     target_lift = float(target_pos[2] - env.target_rest_height)
-    #     orientation_down_alignment = env.get_end_effector_down_alignment()
-
-    #     distance_scale = float(
-    #         env.task_config.get("distance_scale", GraspingTask.DISTANCE_SCALE)
-    #     )
-    #     distance_reward_scale = float(
-    #         env.task_config.get(
-    #             "distance_reward_scale", GraspingTask.DISTANCE_REWARD_SCALE
-    #         )
-    #     )
-    #     orientation_threshold = float(
-    #         env.task_config.get(
-    #             "orientation_threshold", GraspingTask.ORIENTATION_THRESHOLD
-    #         )
-    #     )
-    #     orientation_reward_scale = float(
-    #         env.task_config.get(
-    #             "orientation_reward_scale", GraspingTask.ORIENTATION_REWARD_SCALE
-    #         )
-    #     )
-    #     caging_distance = float(
-    #         env.task_config.get("caging_distance", GraspingTask.CAGING_DISTANCE)
-    #     )
-    #     grasp_reward_scale = float(
-    #         env.task_config.get("grasp_reward_scale", GraspingTask.GRASP_REWARD_SCALE)
-    #     )
-    #     force_threshold = float(
-    #         env.task_config.get(
-    #             "grasp_actuator_force_threshold",
-    #             GraspingTask.GRASP_ACTUATOR_FORCE_THRESHOLD,
-    #         )
-    #     )
-    #     force_scale = float(
-    #         env.task_config.get(
-    #             "grasp_actuator_force_scale", GraspingTask.GRASP_ACTUATOR_FORCE_SCALE
-    #         )
-    #     )
-    #     grasp_width_tolerance = float(
-    #         env.task_config.get(
-    #             "grasp_width_tolerance", GraspingTask.GRASP_WIDTH_TOLERANCE
-    #         )
-    #     )
-    #     lift_clearance = float(
-    #         env.task_config.get("lift_clearance", GraspingTask.LIFT_CLEARANCE)
-    #     )
-    #     lift_height_threshold = float(
-    #         env.task_config.get(
-    #             "lift_height_threshold", GraspingTask.LIFT_HEIGHT_THRESHOLD
-    #         )
-    #     )
-    #     lift_reward_scale = float(
-    #         env.task_config.get("lift_reward_scale", GraspingTask.LIFT_REWARD_SCALE)
-    #     )
-    #     goal_height_tolerance = float(
-    #         env.task_config.get(
-    #             "goal_height_tolerance", GraspingTask.GOAL_HEIGHT_TOLERANCE
-    #         )
-    #     )
-    #     goal_height_reward_scale = float(
-    #         env.task_config.get(
-    #             "goal_height_reward_scale", GraspingTask.GOAL_HEIGHT_REWARD_SCALE
-    #         )
-    #     )
-    #     success_goal_height_threshold = float(
-    #         env.task_config.get(
-    #             "success_goal_height_threshold",
-    #             GraspingTask.SUCCESS_GOAL_HEIGHT_THRESHOLD,
-    #         )
-    #     )
-    #     success_bonus = float(
-    #         env.task_config.get("success_bonus", GraspingTask.SUCCESS_BONUS)
-    #     )
-    #     time_penalty = -float(
-    #         env.task_config.get("time_penalty", GraspingTask.TIME_PENALTY)
-    #     )
-
-    #     distance_score = 1.0 - np.tanh(reach_distance / max(distance_scale, 1e-6))
-    #     orientation_score = np.clip(
-    #         (orientation_down_alignment - orientation_threshold)
-    #         / max(1.0 - orientation_threshold, 1e-6),
-    #         0.0,
-    #         1.0,
-    #     )
-    #     caging_score = np.clip(
-    #         1.0 - reach_distance / max(caging_distance, 1e-6), 0.0, 1.0
-    #     )
-    #     force_score = np.clip(
-    #         (gripper_actuator_force - force_threshold) / max(force_scale, 1e-6),
-    #         0.0,
-    #         1.0,
-    #     )
-    #     expected_grasp_width = 2.0 * float(np.max(env.target_spec.half_extents[:2]))
-    #     width_match_score = np.clip(
-    #         1.0
-    #         - abs(gripper_opening_width - expected_grasp_width)
-    #         / max(grasp_width_tolerance, 1e-6),
-    #         0.0,
-    #         1.0,
-    #     )
-    #     force_grasp_score = force_score * width_match_score
-    #     contact_grasp_score = 1.0 if target_contact_score >= 1.0 else 0.0
-    #     between_fingers_score = max(
-    #         float(width_match_score * caging_score), float(contact_grasp_score)
-    #     )
-    #     grasp_evidence_score = max(float(force_grasp_score), float(contact_grasp_score))
-    #     grasp_score = grasp_evidence_score * (0.5 + 0.5 * float(caging_score))
-    #     lift_progress = np.clip(
-    #         (target_lift - lift_clearance)
-    #         / max(lift_height_threshold - lift_clearance, 1e-6),
-    #         0.0,
-    #         1.0,
-    #     )
-    #     goal_height_score = np.clip(
-    #         0.5 - goal_z_distance / max(goal_height_tolerance, 1e-6), 0.0, 1.0
-    #     )
-
-    #     distance_reward = distance_reward_scale * float(distance_score)
-    #     orientation_reward = orientation_reward_scale * float(orientation_score)
-    #     grasp_reward = grasp_reward_scale * grasp_score
-    #     lift_reward = lift_reward_scale * float(lift_progress)
-    #     goal_height_reward = goal_height_reward_scale * float(goal_height_score)
-
-    #     reward = (
-    #         distance_reward
-    #         + orientation_reward
-    #         + grasp_reward
-    #         + lift_reward
-    #         + goal_height_reward
-    #         + time_penalty
-    #     )
-    #     grasp_detected = bool(grasp_evidence_score > 0.25 and caging_score > 0.25)
-    #     target_between_fingers = bool(
-    #         between_fingers_score > 0.5 and caging_score > 0.25
-    #     )
-    #     is_success = bool(
-    #         target_lift >= lift_height_threshold
-    #         and goal_z_distance <= success_goal_height_threshold
-    #     )
-    #     if is_success:
-    #         reward += success_bonus
-    #         done = True
-
-    #     info.update(
-    #         {
-    #             "reach_distance": reach_distance,
-    #             "ee_target_xy_distance": ee_target_xy_distance,
-    #             "ee_target_z_distance": ee_target_z_distance,
-    #             "gripper_opening_width": gripper_opening_width,
-    #             "gripper_open_fraction": gripper_open_fraction,
-    #             "gripper_actuator_force": gripper_actuator_force,
-    #             "goal_distance": goal_distance,
-    #             "goal_xy_distance": goal_xy_distance,
-    #             "goal_z_distance": goal_z_distance,
-    #             "goal_height_distance": goal_z_distance,
-    #             "target_height_above_table": target_height_above_table,
-    #             "target_lift": target_lift,
-    #             "orientation_down_alignment": orientation_down_alignment,
-    #             "distance_score": float(distance_score),
-    #             "orientation_score": float(orientation_score),
-    #             "caging_score": float(caging_score),
-    #             "force_score": float(force_score),
-    #             "width_match_score": float(width_match_score),
-    #             "target_contact_score": float(target_contact_score),
-    #             "grasp_evidence_score": float(grasp_evidence_score),
-    #             "between_fingers_score": float(between_fingers_score),
-    #             "grasp_resistance_score": float(force_grasp_score),
-    #             "lift_progress": float(lift_progress),
-    #             "goal_height_score": float(goal_height_score),
-    #             "distance_reward": distance_reward,
-    #             "orientation_reward": orientation_reward,
-    #             "grasp_reward": grasp_reward,
-    #             "lift_reward": lift_reward,
-    #             "goal_reward": goal_height_reward,
-    #             "goal_height_reward": goal_height_reward,
-    #             "target_between_fingers": target_between_fingers,
-    #             "grasp_detected": grasp_detected,
-    #             "time_penalty": time_penalty,
-    #             "success_bonus": success_bonus if is_success else 0.0,
-    #             "is_success": is_success,
-    #             "goal_reward_active": bool(goal_height_score > 0.0),
-    #             "reward_total": reward,
-    #         }
-    #     )
-    #     return reward, done, info
 
     @staticmethod
     def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
-        reward = 0.0
-        done = False
-        info = {"task": GraspingTask.NAME, "step": env.step_count}
-
-        target_pos = env.get_target_position() + np.array(
-            [0.0, 0.0, 0.01]
-        )  # Slightly above target center for better grasping
-        ee_pos = env.get_end_effector_position()
-        finger_midpoint = env.get_finger_midpoint_position()
-        lfinger_pos = env.get_left_finger_position()
-        rfinger_pos = env.get_right_finger_position()
-
-        goal_pos = env.goal_position
-
-        reach_distance = float(np.linalg.norm(target_pos - finger_midpoint))
-        ee_object_distance = float(np.linalg.norm(target_pos - ee_pos))
-        goal_z_distance = float(abs(target_pos[2] - goal_pos[2]))
-
-        lfinger_dist = float(np.linalg.norm(lfinger_pos - target_pos))
-        rfinger_dist = float(np.linalg.norm(rfinger_pos - target_pos))
-        finger_dist = 0.5 * (lfinger_dist + rfinger_dist)
-
-        target_lift = float(target_pos[2] - env.target_rest_height)
-
-        distance_scale = float(env.task_config.get("distance_scale", 0.1))
-        lift_height_threshold = float(env.task_config.get("lift_height_threshold", 0.1))
-
-        reach_score = 1.0 - np.tanh(reach_distance / max(distance_scale, 1e-6))
-
-        finger_score = 1.0 - np.tanh(finger_dist / max(distance_scale, 1e-6))
-
-        caging_score = 1.0 - np.tanh(reach_distance / 0.05)
-
-        lift_score = np.clip(target_lift / max(lift_height_threshold, 1e-6), 0.0, 1.0)
-
-        w_reach = 1.0
-        w_finger = 1.0
-        w_caging = 0.5
-        w_lift = 2.0
-
-        reward = (
-            w_reach * reach_score
-            + w_finger * finger_score
-            + w_caging * caging_score
-            + w_lift * lift_score
-        )
-
-        is_success = bool(target_lift >= lift_height_threshold)
-        if is_success:
-            reward += 5.0
-            done = True
-
-        info.update(
-            {
-                "reach_distance": reach_distance,
-                "finger_dist": finger_dist,
-                "target_lift": target_lift,
-                "reach_score": reach_score,
-                "finger_score": finger_score,
-                "caging_score": caging_score,
-                "lift_score": lift_score,
-                "is_success": is_success,
-                "reward_total": reward,
-            }
-        )
-
-        return reward, done, info
+        return GraspingTask.reward_function_shaped(env)
 
     @staticmethod
     def reward_function_shaped(env) -> Tuple[float, bool, Dict[str, Any]]:
-        reward = 0.0
         done = False
         info = {"task": f"{GraspingTask.NAME}_shaped", "step": env.step_count}
 
-        features = GraspingTask._compute_reward_features(env)
+        reaching_terms = GraspingTask._compute_reaching_terms(env)
+        lifting_terms = GraspingTask._compute_lifting_terms(env)
         num_timesteps, n_updates = GraspingTask._get_training_progress(env)
-
-        grasp_weight = GraspingTask._safe_progress_ratio(
-            num_timesteps,
-            float(
-                env.task_config.get(
-                    "grasp_shaping_start_step", GraspingTask.GRASP_SHAPING_START_STEP
-                )
-            ),
-            float(
-                env.task_config.get(
-                    "grasp_shaping_full_step", GraspingTask.GRASP_SHAPING_FULL_STEP
-                )
-            ),
-        )
-        goal_step_weight = GraspingTask._safe_progress_ratio(
-            num_timesteps,
-            float(
-                env.task_config.get(
-                    "goal_reward_start_step", GraspingTask.GOAL_REWARD_START_STEP
-                )
-            ),
-            float(
-                env.task_config.get(
-                    "goal_reward_full_step", GraspingTask.GOAL_REWARD_FULL_STEP
-                )
-            ),
-        )
-        goal_update_weight = GraspingTask._safe_progress_ratio(
-            n_updates,
-            float(
-                env.task_config.get(
-                    "goal_reward_start_update",
-                    GraspingTask.GOAL_REWARD_START_UPDATE,
-                )
-            ),
-            float(
-                env.task_config.get(
-                    "goal_reward_full_update", GraspingTask.GOAL_REWARD_FULL_UPDATE
-                )
-            ),
-        )
-        goal_weight = min(goal_step_weight, goal_update_weight)
-
-        distance_reward_scale = float(
-            env.task_config.get(
-                "distance_reward_scale", GraspingTask.DISTANCE_REWARD_SCALE
-            )
-        )
-        orientation_reward_scale = float(
-            env.task_config.get(
-                "orientation_reward_scale", GraspingTask.ORIENTATION_REWARD_SCALE
-            )
-        )
-        grasp_reward_scale = float(
-            env.task_config.get("grasp_reward_scale", GraspingTask.GRASP_REWARD_SCALE)
-        )
-        lift_reward_scale = float(
-            env.task_config.get("lift_reward_scale", GraspingTask.LIFT_REWARD_SCALE)
-        )
-        goal_height_reward_scale = float(
-            env.task_config.get(
-                "goal_height_reward_scale", GraspingTask.GOAL_HEIGHT_REWARD_SCALE
-            )
-        )
-        success_bonus = float(
-            env.task_config.get("success_bonus", GraspingTask.SUCCESS_BONUS)
-        )
-        time_penalty = -float(
-            env.task_config.get("time_penalty", GraspingTask.TIME_PENALTY)
+        weights = GraspingTask._get_curriculum_weights(env, num_timesteps)
+        reward_terms = GraspingTask._blend_reward_terms(
+            reaching_terms, lifting_terms, weights
         )
 
-        base_distance_reward = distance_reward_scale * features["distance_score"]
-        base_orientation_reward = (
-            orientation_reward_scale * features["orientation_score"]
-        )
-        base_grasp_reward = grasp_reward_scale * (
-            0.60 * features["grasp_score"] + 0.40 * features["grasp_evidence_score"]
-        )
-        lift_reward = lift_reward_scale * features["lift_progress"]
-        base_goal_reward = goal_height_reward_scale * features["goal_height_score"]
-
-        reward = (
-            base_distance_reward
-            + base_orientation_reward
-            + grasp_weight * base_grasp_reward
-            + max(grasp_weight, 0.25) * lift_reward
-            + goal_weight * base_goal_reward
-            + time_penalty
-        )
-
-        is_success = bool(features["is_success"])
-        if is_success:
-            reward += success_bonus
-            done = True
+        success_bonus = float(env.task_config.get("success_bonus", 0.0))
+        # is_success = bool(lifting_terms["is_success"])
+        # success_bonus_value = success_bonus if is_success else 0.0
+        reward = reward_terms["reward_total"]
+        # if is_success:
+        #    reward += success_bonus_value
+        #    done = True
 
         info.update(
             {
-                **features,
                 "training_num_timesteps": num_timesteps,
                 "training_n_updates": n_updates,
-                "grasp_curriculum_weight": grasp_weight,
-                "goal_curriculum_weight": goal_weight,
-                "distance_reward": base_distance_reward,
-                "orientation_reward": base_orientation_reward,
-                "grasp_reward": grasp_weight * base_grasp_reward,
-                "lift_reward": max(grasp_weight, 0.25) * lift_reward,
-                "goal_reward": goal_weight * base_goal_reward,
-                "goal_height_reward": goal_weight * base_goal_reward,
-                "time_penalty": time_penalty,
-                "success_bonus": success_bonus if is_success else 0.0,
-                "goal_reward_active": bool(goal_weight > 0.0),
-                "reward_total": reward,
+                **reward_terms,
+                "reward_total": float(reward),
+                "curriculum_phase": weights["curriculum_phase"],
+                "curriculum_phase_index": weights["curriculum_phase_index"],
+                "reaching_weight": weights["reaching_weight"],
+                "close_phase_weight": weights["close_phase_weight"],
+                "lifting_weight": weights["lifting_weight"],
+                "close_weight": weights["close_weight"],
+                "bonus_weight": weights["bonus_weight"],
+                "table_distance_weight": weights["table_distance_weight"],
+                "ee_distance": reaching_terms["ee_distance"],
+                "gripper_can_distance": lifting_terms["gripper_can_distance"],
+                "target_table_distance": lifting_terms["target_table_distance"],
+                "gripper_open_fraction": lifting_terms["gripper_open_fraction"],
+                "gripper_actuator_force": lifting_terms["gripper_actuator_force"],
+                "close_reward": lifting_terms["close_reward"],
+                "bonus_reward": lifting_terms["bonus_reward"],
+                "approach_reward": lifting_terms["approach_reward"],
+                "table_distance_reward": lifting_terms["table_distance_reward"],
+                "in_success_pose": reaching_terms["in_success_pose"],
+                "success_hold_count": reaching_terms["success_hold_count"],
+                "success_hold_steps": reaching_terms["success_hold_steps"],
+                "bonus_reward_active": lifting_terms["bonus_reward_active"],
+                "bonus_hold_count": lifting_terms["bonus_hold_count"],
+                # "success_bonus": float(success_bonus_value),
+                #  "is_success": is_success,
+                "goal_reward_active": False,
             }
         )
 
-        return reward, done, info
+        return float(reward), done, info
 
 
 def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
@@ -904,7 +1032,7 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
     Create a task configuration by name.
 
     Args:
-        task_name: 'grasping'
+        task_name: 'grasping', 'reaching', 'lifting', 'lifting_only', or 'placing'
         **kwargs: Additional parameters to override defaults
 
     Returns:
@@ -914,6 +1042,12 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
         config = GraspingTask.get_default_config()
     elif task_name == "reaching":
         config = ReachingTask.get_default_config()
+    elif task_name == "lifting":
+        config = LiftingTask.get_default_config()
+    elif task_name == "lifting_only":
+        config = LiftingOnlyTask.get_default_config()
+    elif task_name == "placing":
+        config = PlacingTask.get_default_config()
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
@@ -925,6 +1059,21 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
             config["reward_fn"] = GraspingTask.reward_function
         elif reward_variant == "shaped":
             config["reward_fn"] = GraspingTask.reward_function_shaped
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif task_name == "lifting":
+        if reward_variant in {"default", "lifting"}:
+            config["reward_fn"] = LiftingTask.reward_function
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif task_name == "lifting_only":
+        if reward_variant in {"default", "lifting_only"}:
+            config["reward_fn"] = LiftingOnlyTask.reward_function
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif task_name == "placing":
+        if reward_variant in {"default", "placing"}:
+            config["reward_fn"] = PlacingTask.reward_function
         else:
             raise ValueError(f"Unknown reward variant: {reward_variant}")
     elif reward_variant in {"default", "reaching"}:

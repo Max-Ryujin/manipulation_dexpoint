@@ -1,6 +1,5 @@
 """Gym Environment wrapper for Franka robot with point cloud observations."""
 
-from curses import flash
 import math
 import os
 import time
@@ -63,6 +62,7 @@ class FrankaGymEnvironment(gym.Env):
         pointcloud_alpha: float = 0.2,
         capture_episode_frames: bool = False,
         use_depth_only_pointcloud: bool = False,
+        ycb_object_names: Optional[List[str]] = None,
     ):
         """
         Initialize the Franka gym environment.
@@ -85,6 +85,11 @@ class FrankaGymEnvironment(gym.Env):
             pointcloud_point_size: Size of rendered point cloud dots in pixels (default: 4)
             pointcloud_alpha: Transparency of point cloud overlay (0-1, default: 0.7)
             capture_episode_frames: Whether to capture RGB frames on every step for debug videos
+            ycb_object_names: Optional list of YCB object folder names to randomly sample per
+                episode (e.g. ["005_tomato_soup_can", "006_mustard_bottle"]).  When provided
+                with more than one entry, the environment keeps a cached MuJoCo runtime for each
+                object and swaps between them across episodes.  Names are resolved relative to
+                the parent directory of *ycb_object_root*.
         """
         self.task_name = task_name
         self.num_points = num_points
@@ -149,6 +154,9 @@ class FrankaGymEnvironment(gym.Env):
             self.env.model
         )
         self.table_height = float(self.workspace_info["table_height"])
+        self.table_body_name = str(self.workspace_info["table_body_name"])
+        self.target_id = int(self.env.model.body(self.target_body_name).id)
+        self.table_body_id = int(self.env.model.body(self.table_body_name).id)
         self.target_rest_height = self.table_height + float(
             self.target_spec.rest_offset_z
         )
@@ -185,6 +193,8 @@ class FrankaGymEnvironment(gym.Env):
         self.task_config = {}
         self.max_episode_steps = 700
         self.step_count = 0
+        self.training_num_timesteps = 0
+        self.training_n_updates = 0
 
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
@@ -193,8 +203,191 @@ class FrankaGymEnvironment(gym.Env):
         self._pointcloud_timing_totals: Dict[str, float] = {}
         self._pointcloud_timing_count = 0
 
+        # Build per-episode object pool for multi-object training.
+        # Each entry: {"name": str, "xml_path": str, "object_spec": YCBObjectSpec}
+        self._ycb_object_pool: Optional[List[Dict]] = None
+        self._object_runtime_cache: Dict[int, Dict[str, Any]] = {}
+        self._active_object_pool_index: int = 0
+        self._fixed_object_pool_index: Optional[int] = None
+        if ycb_object_names and len(ycb_object_names) > 1:
+            pool: List[Dict] = []
+            initial_pool_index: Optional[int] = None
+            for name in ycb_object_names:
+                obj_root = self.ycb_object_root.parent / name
+                xml_path_p, obj_spec = ensure_single_object_ycb_scene(
+                    obj_root,
+                    scale=self.target_scale,
+                    source=self.ycb_asset_source,
+                )
+                pool.append(
+                    {
+                        "name": name,
+                        "object_root": obj_root,
+                        "xml_path": xml_path_p.as_posix(),
+                        "object_spec": obj_spec,
+                    }
+                )
+                # Find which pool entry matches the initially loaded object.
+                if name == self.ycb_object_root.name:
+                    initial_pool_index = len(pool) - 1
+            self._ycb_object_pool = pool
+            if initial_pool_index is not None:
+                self._active_object_pool_index = initial_pool_index
+                self._object_runtime_cache[initial_pool_index] = (
+                    self._capture_current_runtime_bundle()
+                )
+            else:
+                self._close_runtime_bundle(self._capture_current_runtime_bundle())
+                self._switch_runtime_for_object(0)
+
+    # ------------------------------------------------------------------
+    # Multi-object helpers
+    # ------------------------------------------------------------------
+
+    def _capture_current_runtime_bundle(self) -> Dict[str, Any]:
+        """Capture the currently active MuJoCo runtime so it can be reused later."""
+        return {
+            "env": self.env,
+            "camera": self.camera,
+            "hand_body_id": self.hand_body_id,
+            "attachment_site_id": self.attachment_site_id,
+            "ctrl_min": self.ctrl_min,
+            "ctrl_max": self.ctrl_max,
+            "gripper_ctrl_min": self.gripper_ctrl_min,
+            "gripper_ctrl_max": self.gripper_ctrl_max,
+            "workspace_bounds": self.workspace_bounds,
+            "workspace_info": self.workspace_info,
+            "table_height": self.table_height,
+            "table_body_name": self.table_body_name,
+            "target_id": self.target_id,
+            "table_body_id": self.table_body_id,
+            "target_spec": self.target_spec,
+            "target_rest_height": self.target_rest_height,
+            "ycb_object_root": self.ycb_object_root,
+            "xml_path": self.xml_path,
+        }
+
+    def _create_runtime_bundle(self, pool_index: int) -> Dict[str, Any]:
+        """Create a reusable MuJoCo runtime bundle for one object in the pool."""
+        entry = self._ycb_object_pool[pool_index]
+        env = FrankaEnvironment(entry["xml_path"], rate=self.rate, frame_skip=self.frame_skip)
+        env.set_viewer_marker_callback(self._get_viewer_debug_markers)
+        camera = MujocoCamera(env, width=self.camera_width, height=self.camera_height)
+        workspace_bounds, workspace_info = get_workspace_configuration(env.model)
+        table_height = float(workspace_info["table_height"])
+        table_body_name = str(workspace_info["table_body_name"])
+        ctrl_min = env.model.actuator_ctrlrange[: self.robot_dof, 0]
+        ctrl_max = env.model.actuator_ctrlrange[: self.robot_dof, 1]
+        return {
+            "env": env,
+            "camera": camera,
+            "hand_body_id": env.model.body("hand").id,
+            "attachment_site_id": env.model.site("attachment_site").id,
+            "ctrl_min": ctrl_min,
+            "ctrl_max": ctrl_max,
+            "gripper_ctrl_min": float(ctrl_min[7]),
+            "gripper_ctrl_max": float(ctrl_max[7]),
+            "workspace_bounds": workspace_bounds,
+            "workspace_info": workspace_info,
+            "table_height": table_height,
+            "table_body_name": table_body_name,
+            "target_id": int(env.model.body(self.target_body_name).id),
+            "table_body_id": int(env.model.body(table_body_name).id),
+            "target_spec": entry["object_spec"],
+            "target_rest_height": table_height + float(entry["object_spec"].rest_offset_z),
+            "ycb_object_root": entry["object_root"],
+            "xml_path": entry["xml_path"],
+        }
+
+    def _activate_runtime_bundle(self, bundle: Dict[str, Any], pool_index: int) -> None:
+        """Swap this wrapper onto a cached MuJoCo runtime bundle."""
+        self.env = bundle["env"]
+        self.camera = bundle["camera"]
+        self.hand_body_id = bundle["hand_body_id"]
+        self.attachment_site_id = bundle["attachment_site_id"]
+        self.ctrl_min = bundle["ctrl_min"]
+        self.ctrl_max = bundle["ctrl_max"]
+        self.gripper_ctrl_min = bundle["gripper_ctrl_min"]
+        self.gripper_ctrl_max = bundle["gripper_ctrl_max"]
+        self.workspace_bounds = bundle["workspace_bounds"]
+        self.workspace_info = bundle["workspace_info"]
+        self.table_height = bundle["table_height"]
+        self.table_body_name = bundle["table_body_name"]
+        self.target_id = bundle["target_id"]
+        self.table_body_id = bundle["table_body_id"]
+        self.target_spec = bundle["target_spec"]
+        self.target_rest_height = bundle["target_rest_height"]
+        self.ycb_object_root = bundle["ycb_object_root"]
+        self.xml_path = bundle["xml_path"]
+        self._active_object_pool_index = pool_index
+
+    def _close_runtime_bundle(self, bundle: Dict[str, Any]) -> None:
+        """Release renderer and viewer resources held by a runtime bundle."""
+        camera = bundle.get("camera")
+        env = bundle.get("env")
+        if camera is not None:
+            camera.close()
+        if env is not None:
+            env.close()
+
+    def _switch_runtime_for_object(self, pool_index: int) -> None:
+        """Swap the active runtime to a cached object-specific MuJoCo bundle."""
+        if self._ycb_object_pool is None:
+            return
+        bundle = self._object_runtime_cache.get(pool_index)
+        if bundle is None:
+            bundle = self._create_runtime_bundle(pool_index)
+            self._object_runtime_cache[pool_index] = bundle
+        self._activate_runtime_bundle(bundle, pool_index)
+
+    def get_available_object_names(self) -> List[str]:
+        """Return the object names available to this environment."""
+        if self._ycb_object_pool is None:
+            return [self.ycb_object_root.name]
+        return [str(entry["name"]) for entry in self._ycb_object_pool]
+
+    def get_active_object_name(self) -> str:
+        """Return the currently loaded object's name."""
+        return str(self.ycb_object_root.name)
+
+    def set_fixed_object(self, object_name: Optional[str]) -> None:
+        """Pin resets to a specific object name, or clear the override."""
+        if object_name is None:
+            self._fixed_object_pool_index = None
+            return
+
+        if self._ycb_object_pool is None:
+            if object_name != self.ycb_object_root.name:
+                raise ValueError(
+                    f"Environment only has object '{self.ycb_object_root.name}', got '{object_name}'"
+                )
+            self._fixed_object_pool_index = None
+            return
+
+        for index, entry in enumerate(self._ycb_object_pool):
+            if entry["name"] != object_name:
+                continue
+            self._fixed_object_pool_index = index
+            if index != self._active_object_pool_index:
+                self._switch_runtime_for_object(index)
+            return
+
+        available = ", ".join(self.get_available_object_names())
+        raise ValueError(
+            f"Unknown object '{object_name}'. Available objects: {available}"
+        )
+
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment and return initial observation."""
+        # Pick a random object from the pool before resetting.
+        if self._ycb_object_pool is not None:
+            if self._fixed_object_pool_index is None:
+                new_index = int(self._rng.integers(0, len(self._ycb_object_pool)))
+            else:
+                new_index = int(self._fixed_object_pool_index)
+            if new_index != self._active_object_pool_index:
+                self._switch_runtime_for_object(new_index)
+
         self.env.reset()
         self.env.clear_collision_exceptions()
 
@@ -234,7 +427,7 @@ class FrankaGymEnvironment(gym.Env):
 
     def _reset_target_pose(self) -> None:
         bounds = self.workspace_bounds
-        placement_margin = float(self.target_spec.placement_radius + 0.02)
+        placement_margin = float(self.target_spec.placement_radius)
 
         min_x = bounds["min_x"] + placement_margin
         max_x = bounds["max_x"] - placement_margin
@@ -273,37 +466,19 @@ class FrankaGymEnvironment(gym.Env):
     def _sample_goal_position(
         self, target_position: Optional[np.ndarray] = None
     ) -> None:
-        """Sample a task goal position for the current episode."""
-        if self.task_name == "grasping" and target_position is not None:
-            self.goal_position = np.array(
-                [
-                    float(target_position[0]),
-                    float(target_position[1]),
-                    float(self.target_rest_height + self.success_lift_height),
-                ],
-                dtype=np.float32,
-            )
-            return
 
-        if self.task_name == "reaching" and target_position is not None:
-            self.goal_position = np.asarray(target_position, dtype=np.float32).copy()
-            return
-
-        bounds = self.workspace_bounds
-        x = float(self._rng.uniform(bounds["min_x"], bounds["max_x"]))
-        y = float(self._rng.uniform(bounds["min_y"], bounds["max_y"]))
-        z = self.table_height + float(
-            self._rng.uniform(self.goal_height_range[0], self.goal_height_range[1])
-        )
-        self.goal_position = np.array([x, y, z], dtype=np.float32)
+        return np.asarray(target_position, dtype=np.float32).copy()
 
     def get_target_position(self) -> np.ndarray:
-        return (
-            self.env.data.site_xpos[self.env.model.site("target_offset_site").id]
-            .copy()
-            .astype(np.float32)
-        )
-        # return self.env.get_object_position(self.target_body_name)
+        # check if target_offset_site exists in the model, if so use its position as the target position, otherwise fall back to using the target body's position
+        if self.env.model.site("target_offset_site") is not None:
+            return (
+                self.env.data.site_xpos[self.env.model.site("target_offset_site").id]
+                .copy()
+                .astype(np.float32)
+            )
+        else:
+            return self.env.get_object_position(self.target_body_name)
 
     def _get_viewer_debug_markers(self) -> List[Dict[str, Any]]:
         target_pos = self.get_target_position().astype(np.float64)
@@ -457,6 +632,7 @@ class FrankaGymEnvironment(gym.Env):
             raise ValueError(
                 f"Expected action shape {(self.robot_dof,)}, got {action.shape}"
             )
+        self._last_action = action.copy()
 
         arm_action = action[:7]
         gripper_action = action[7]
@@ -465,7 +641,7 @@ class FrankaGymEnvironment(gym.Env):
 
         rl_dt = self.env.model.opt.timestep * self.env.frame_skip
 
-        target_arm_qpos = current_arm_qpos + (1.5 * arm_action * rl_dt)
+        target_arm_qpos = current_arm_qpos + (1.4 * arm_action * rl_dt)
 
         target_gripper_ctrl = ((gripper_action + 1.0) / 2.0) * (
             self.ctrl_max[7] - self.ctrl_min[7]
@@ -717,6 +893,13 @@ class FrankaGymEnvironment(gym.Env):
         """Set a custom reward function."""
         self.task_config["reward_fn"] = reward_fn
 
+    def set_training_progress(self, num_timesteps: int, n_updates: int) -> None:
+        """Expose global learner progress to task rewards even when wrapped by Monitor."""
+        self.training_num_timesteps = int(num_timesteps)
+        self.training_n_updates = int(n_updates)
+        self.task_config["training_num_timesteps"] = self.training_num_timesteps
+        self.task_config["training_n_updates"] = self.training_n_updates
+
     def render(self, mode: str = "human") -> Optional[np.ndarray]:
         """
         Render the environment.
@@ -862,6 +1045,18 @@ class FrankaGymEnvironment(gym.Env):
 
     def close(self):
         """Close environment and viewer."""
+        if self._object_runtime_cache:
+            closed_runtime_ids = set()
+            for bundle in self._object_runtime_cache.values():
+                env = bundle.get("env")
+                runtime_id = id(env)
+                if runtime_id in closed_runtime_ids:
+                    continue
+                self._close_runtime_bundle(bundle)
+                closed_runtime_ids.add(runtime_id)
+            self._object_runtime_cache.clear()
+            return
+
         if self.env.viewer is not None:
             self.env.viewer.close()
 

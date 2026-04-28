@@ -140,6 +140,8 @@ class FrankaEnvironment(BaseEnvironment):
     def reset(self):
         self.data.ctrl[:] = self.initial_ctrl
         self.data.qpos[:] = self.initial_qpos
+        # add noise to the qpos
+        self.data.qpos += np.random.normal(0, 0.01, size=self.data.qpos.shape)
         self.data.qvel[:] = self.initial_qvel
         self.ik.update_configuration(self.data.qpos)
         mujoco.mj_forward(self.model, self.data)
