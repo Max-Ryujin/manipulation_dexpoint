@@ -158,9 +158,38 @@ def collect_fused_pointcloud_for_training(
     min_height_above_table: float = 0.01,
     hand_sphere_radius: float = 0.12,
     timing_stats: Optional[dict[str, float]] = None,
+    cache_steps: int = 1,
+    cache_state: Optional[dict[str, object]] = None,
 ) -> np.ndarray:
-    """Collect a fused point cloud for training using depth only."""
+    """Collect a fused point cloud for training using depth only.
+    
+    Args:
+        cache_steps: Number of steps to reuse the last cached pointcloud. 
+                    Set to 0 to disable caching.
+        cache_state: Dictionary to track cache state. Should be initialized by caller
+                    as {} or a dict with 'pointcloud', 'steps_remaining', etc.
+                    This allows the caller to manage cache across multiple calls.
+    """
     collection_start = time.perf_counter()
+    
+    # Initialize cache_state if not provided
+    if cache_state is None:
+        cache_state = {}
+    
+    # Check if we should use cached pointcloud
+    if cache_steps > 0:
+        steps_remaining = cache_state.get("steps_remaining", 0)
+        if steps_remaining > 0 and "pointcloud" in cache_state:
+            cache_state["steps_remaining"] = steps_remaining - 1
+            if timing_stats is not None:
+                timing_stats["collect_cache_hits"] = (
+                    timing_stats.get("collect_cache_hits", 0) + 1
+                )
+                timing_stats["collect_cache_hit_s"] = timing_stats.get(
+                    "collect_cache_hit_s", 0.0
+                ) + (time.perf_counter() - collection_start)
+            return cache_state["pointcloud"]
+    
     all_points: list[np.ndarray] = []
     samples_per_camera = get_pointcloud_samples_per_camera(num_points, camera_names)
 
@@ -222,19 +251,10 @@ def collect_fused_pointcloud_for_training(
 
     concat_start = time.perf_counter()
     if not all_points:
-        if timing_stats is not None:
-            timing_stats["collect_concat_s"] = timing_stats.get(
-                "collect_concat_s", 0.0
-            ) + (time.perf_counter() - concat_start)
-            timing_stats["collect_total_s"] = timing_stats.get(
-                "collect_total_s", 0.0
-            ) + (time.perf_counter() - collection_start)
-            timing_stats["collect_merged_points"] = timing_stats.get(
-                "collect_merged_points", 0.0
-            )
-        return np.zeros((0, 3), dtype=np.float32)
-
-    merged_points = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
+        result = np.zeros((0, 3), dtype=np.float32)
+    else:
+        result = np.concatenate(all_points, axis=0).astype(np.float32, copy=False)
+    
     if timing_stats is not None:
         timing_stats["collect_concat_s"] = timing_stats.get("collect_concat_s", 0.0) + (
             time.perf_counter() - concat_start
@@ -244,8 +264,14 @@ def collect_fused_pointcloud_for_training(
         )
         timing_stats["collect_merged_points"] = timing_stats.get(
             "collect_merged_points", 0.0
-        ) + float(len(merged_points))
-    return merged_points
+        ) + float(len(result))
+    
+    # Store in cache if caching is enabled
+    if cache_steps > 0:
+        cache_state["pointcloud"] = result
+        cache_state["steps_remaining"] = cache_steps
+    
+    return result
 
 
 def sample_pointcloud(
