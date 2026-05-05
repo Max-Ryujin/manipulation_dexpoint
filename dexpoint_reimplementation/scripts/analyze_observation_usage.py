@@ -13,6 +13,9 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch as th
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
 
 from _script_bootstrap import ensure_script_imports
@@ -32,6 +35,235 @@ OBSERVATION_GROUP_KEYS = [
     "goal_position",
 ]
 BRANCH_KEYS = ["pointcloud", "proprio"]
+
+
+def _weight_tensor_to_matrix(weight: th.Tensor) -> np.ndarray:
+    matrix = weight.detach().cpu().float()
+    if matrix.ndim == 0:
+        matrix = matrix.reshape(1, 1)
+    elif matrix.ndim == 1:
+        matrix = matrix.unsqueeze(0)
+    elif matrix.ndim > 2:
+        matrix = matrix.reshape(matrix.shape[0], -1)
+    return matrix.numpy()
+
+
+def _named_weight_matrices(
+    module: nn.Module, allowed_types: Tuple[type, ...]
+) -> List[Tuple[str, np.ndarray]]:
+    matrices = []
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, allowed_types) and hasattr(submodule, "weight"):
+            label = name or submodule.__class__.__name__
+            matrices.append((label, _weight_tensor_to_matrix(submodule.weight)))
+    return matrices
+
+
+def _path_weight_matrices(
+    named_modules: Sequence[Tuple[str, nn.Module]],
+) -> List[Tuple[str, np.ndarray]]:
+    matrices = []
+    for prefix, module in named_modules:
+        for name, submodule in module.named_modules():
+            if isinstance(submodule, nn.Linear):
+                label = prefix if not name else f"{prefix}.{name}"
+                matrices.append((label, _weight_tensor_to_matrix(submodule.weight)))
+    return matrices
+
+
+def _matrix_color_limit(matrix: np.ndarray) -> float:
+    if matrix.size == 0:
+        return 1.0
+    percentile = float(np.percentile(np.abs(matrix), 99.0))
+    if percentile <= 0.0:
+        maximum = float(np.max(np.abs(matrix)))
+        return maximum if maximum > 0.0 else 1.0
+    return percentile
+
+
+def _plot_weight_matrix_overview(
+    title: str,
+    matrices: Sequence[Tuple[str, np.ndarray]],
+    output_path: Path,
+    subtitle: Optional[str] = None,
+) -> None:
+    if not matrices:
+        return
+
+    row_count = len(matrices)
+    fig, axes = plt.subplots(
+        row_count,
+        2,
+        figsize=(14, max(3.5 * row_count, 4.5)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    fig.patch.set_facecolor("#f8f5ee")
+    fig.suptitle(title, fontsize=16, y=1.02)
+    if subtitle:
+        fig.text(0.5, 0.995, subtitle, ha="center", va="top", fontsize=10)
+
+    for row_index, (label, matrix) in enumerate(matrices):
+        heat_ax = axes[row_index][0]
+        hist_ax = axes[row_index][1]
+        color_limit = _matrix_color_limit(matrix)
+        image = heat_ax.imshow(
+            matrix,
+            aspect="auto",
+            cmap="coolwarm",
+            vmin=-color_limit,
+            vmax=color_limit,
+            interpolation="nearest",
+        )
+        heat_ax.set_title(f"{label} ({matrix.shape[0]} x {matrix.shape[1]})")
+        heat_ax.set_xlabel("input index")
+        heat_ax.set_ylabel("output index")
+        fig.colorbar(image, ax=heat_ax, fraction=0.046, pad=0.04)
+
+        flat = matrix.reshape(-1)
+        hist_ax.hist(flat, bins=60, color="#2c6e9e", alpha=0.9)
+        hist_ax.axvline(0.0, color="#4a4a4a", linewidth=1)
+        hist_ax.set_title(f"{label} value distribution")
+        hist_ax.set_xlabel("weight value")
+        hist_ax.set_ylabel("count")
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_effective_map(
+    title: str,
+    matrix: th.Tensor,
+    output_path: Path,
+    feature_slices: Mapping[str, slice],
+    subtitle: Optional[str] = None,
+) -> None:
+    matrix_np = matrix.detach().cpu().numpy()
+    column_mass = matrix.abs().sum(dim=0).detach().cpu().numpy()
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(15, 9),
+        gridspec_kw={"height_ratios": [4, 1.6]},
+        constrained_layout=True,
+    )
+    fig.patch.set_facecolor("#f8f5ee")
+    fig.suptitle(title, fontsize=16)
+    if subtitle:
+        fig.text(0.5, 0.965, subtitle, ha="center", va="top", fontsize=10)
+
+    heat_ax, mass_ax = axes
+    color_limit = _matrix_color_limit(matrix_np)
+    image = heat_ax.imshow(
+        matrix_np,
+        aspect="auto",
+        cmap="coolwarm",
+        vmin=-color_limit,
+        vmax=color_limit,
+        interpolation="nearest",
+    )
+    heat_ax.set_ylabel("output index")
+    heat_ax.set_xlabel("feature index")
+    heat_ax.set_title(f"effective matrix ({matrix_np.shape[0]} x {matrix_np.shape[1]})")
+    fig.colorbar(image, ax=heat_ax, fraction=0.046, pad=0.04)
+
+    mass_ax.plot(column_mass, color="#c97339", linewidth=2)
+    mass_ax.fill_between(np.arange(column_mass.shape[0]), column_mass, color="#c97339", alpha=0.2)
+    mass_ax.set_xlabel("feature index")
+    mass_ax.set_ylabel("abs column sum")
+    mass_ax.set_title("downstream absolute column mass")
+
+    for label, column_slice in feature_slices.items():
+        start = int(column_slice.start)
+        stop = int(column_slice.stop)
+        center = start + max(stop - start, 1) / 2.0
+        heat_ax.axvline(start - 0.5, color="#2f2f2f", linewidth=1)
+        mass_ax.axvline(start - 0.5, color="#2f2f2f", linewidth=1)
+        heat_ax.text(
+            center,
+            -0.08,
+            f"{label}\n[{start}:{stop}]",
+            ha="center",
+            va="top",
+            transform=heat_ax.get_xaxis_transform(),
+            fontsize=9,
+        )
+    final_stop = int(list(feature_slices.values())[-1].stop)
+    heat_ax.axvline(final_stop - 0.5, color="#2f2f2f", linewidth=1)
+    mass_ax.axvline(final_stop - 0.5, color="#2f2f2f", linewidth=1)
+
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _generate_weight_visualizations(
+    policy: nn.Module, layout: Mapping[str, object], output_dir: Path
+) -> None:
+    pointnet_matrices = _named_weight_matrices(
+        policy.features_extractor.pointnet_extractor.pointnet,
+        (nn.Linear, nn.Conv1d, nn.Conv2d),
+    )
+    _plot_weight_matrix_overview(
+        title="PointNet Weight Overview",
+        matrices=pointnet_matrices,
+        output_path=output_dir / "pointnet_weight_overview.png",
+        subtitle="Each row shows a PointNet layer heatmap and weight histogram",
+    )
+
+    actor_modules = [
+        ("shared", policy.mlp_extractor.shared_net),
+        ("policy", policy.mlp_extractor.policy_net),
+        ("action", policy.action_net),
+    ]
+    critic_modules = [
+        ("shared", policy.mlp_extractor.shared_net),
+        ("value", policy.mlp_extractor.value_net),
+        ("critic", policy.value_net),
+    ]
+    _plot_weight_matrix_overview(
+        title="Actor Path Weight Overview",
+        matrices=_path_weight_matrices(actor_modules),
+        output_path=output_dir / "actor_weight_overview.png",
+        subtitle="Linear layers from fused features to action outputs",
+    )
+    _plot_weight_matrix_overview(
+        title="Critic Path Weight Overview",
+        matrices=_path_weight_matrices(critic_modules),
+        output_path=output_dir / "critic_weight_overview.png",
+        subtitle="Linear layers from fused features to value output",
+    )
+
+    actor_effective = _effective_linear_map(
+        [
+            policy.mlp_extractor.shared_net,
+            policy.mlp_extractor.policy_net,
+            policy.action_net,
+        ],
+        input_dim=policy.features_dim,
+    )
+    critic_effective = _effective_linear_map(
+        [
+            policy.mlp_extractor.shared_net,
+            policy.mlp_extractor.value_net,
+            policy.value_net,
+        ],
+        input_dim=policy.features_dim,
+    )
+    _plot_effective_map(
+        title="Actor Effective Weight Map",
+        matrix=actor_effective,
+        output_path=output_dir / "actor_effective_weights.png",
+        feature_slices=layout["feature_slices"],
+        subtitle="Collapsed linear map from fused features into action logits/means",
+    )
+    _plot_effective_map(
+        title="Critic Effective Weight Map",
+        matrix=critic_effective,
+        output_path=output_dir / "critic_effective_weights.png",
+        feature_slices=layout["feature_slices"],
+        subtitle="Collapsed linear map from fused features into scalar value output",
+    )
 
 
 def _linear_layers(module: nn.Module) -> List[nn.Linear]:
@@ -144,6 +376,13 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
         "pointcloud_shape": pointcloud_shape,
         "raw_dims": OrderedDict(
             pointcloud=int(np.prod(pointcloud_shape)),
+            joint_state=joint_dim,
+            ee_position=ee_dim,
+            target_position=target_dim,
+            goal_position=goal_dim,
+        ),
+        "encoded_dims": OrderedDict(
+            pointcloud=pointcloud_feature_dim,
             joint_state=joint_dim,
             ee_position=ee_dim,
             target_position=target_dim,
@@ -358,6 +597,7 @@ def _build_report(
     usage: Mapping[str, object],
 ) -> str:
     raw_dims = layout["raw_dims"]
+    encoded_dims = layout["encoded_dims"]
     lines = [
         "DexPoint Observation Usage Analysis",
         "",
@@ -366,20 +606,23 @@ def _build_report(
         "",
         "Method:",
         "  - Loads the trained PPO policy and inspects trained weights only.",
-        "  - Pointcloud usage is measured at the learned pointcloud feature branch.",
+        "  - Pointcloud usage is measured after the PointNet encoder, at the learned pointcloud feature branch.",
         "  - joint_state / ee_position / target_position / goal_position usage is traced through the proprio MLP into actor and critic readouts.",
         "  - Absolute shares are based on effective linear weight mass, so they are an approximation of reliance, not a causal attribution.",
         "  - Relative importance shares divide each group's score by its analysis dimensionality before normalizing across groups.",
-        "  - For pointcloud this uses learned pointcloud feature width, because the point encoder is nonlinear and the script does not trace attribution back to raw points.",
+        "  - For pointcloud this uses the learned PointNet feature width rather than the raw 512 x 3 input width, because the point encoder is nonlinear and the script does not trace attribution back to raw points.",
         "",
         "Observation layout:",
-        f"  - pointcloud: shape={layout['pointcloud_shape']} raw_dims={raw_dims['pointcloud']}",
+        f"  - pointcloud raw input: shape={layout['pointcloud_shape']} raw_dims={raw_dims['pointcloud']}",
+        f"  - pointcloud encoded feature dim (after PointNet): {encoded_dims['pointcloud']}",
         f"  - joint_state: dims={raw_dims['joint_state']}",
         f"  - ee_position: dims={raw_dims['ee_position']}",
         f"  - target_position: dims={raw_dims['target_position']}",
         f"  - goal_position: dims={raw_dims['goal_position']}",
         f"  - pointcloud feature dim: {layout['pointcloud_feature_dim']}",
         f"  - proprio feature dim: {layout['proprio_feature_dim']}",
+        "  - encoded observation dims used for group-level attribution: "
+        + ", ".join(f"{key}={value}" for key, value in encoded_dims.items()),
         "  - size-normalized group dims: "
         + ", ".join(
             f"{key}={value}" for key, value in layout["group_analysis_dims"].items()
@@ -494,6 +737,11 @@ def _build_report(
     lines.append("  - proprio_first_layer_relative.png")
     lines.append("  - branch_usage.png")
     lines.append("  - branch_relative_usage.png")
+    lines.append("  - pointnet_weight_overview.png")
+    lines.append("  - actor_weight_overview.png")
+    lines.append("  - critic_weight_overview.png")
+    lines.append("  - actor_effective_weights.png")
+    lines.append("  - critic_effective_weights.png")
     return "\n".join(lines)
 
 
@@ -572,6 +820,7 @@ def _draw_bar_chart(
 
 
 def _write_outputs(
+    policy: nn.Module,
     checkpoint_path: Path,
     output_dir: Path,
     layout: Mapping[str, object],
@@ -593,12 +842,30 @@ def _write_outputs(
         "observation_layout": {
             "pointcloud_shape": list(layout["pointcloud_shape"]),
             "raw_dims": dict(layout["raw_dims"]),
+            "encoded_dims": dict(layout["encoded_dims"]),
             "pointcloud_feature_dim": int(layout["pointcloud_feature_dim"]),
             "proprio_feature_dim": int(layout["proprio_feature_dim"]),
             "proprio_input_dim": int(layout["proprio_input_dim"]),
             "group_analysis_dims": dict(layout["group_analysis_dims"]),
             "branch_analysis_dims": dict(layout["branch_analysis_dims"]),
         },
+        "visualization_files": [
+            "actor_usage.png",
+            "critic_usage.png",
+            "combined_usage.png",
+            "actor_relative_usage.png",
+            "critic_relative_usage.png",
+            "combined_relative_usage.png",
+            "proprio_first_layer.png",
+            "proprio_first_layer_relative.png",
+            "branch_usage.png",
+            "branch_relative_usage.png",
+            "pointnet_weight_overview.png",
+            "actor_weight_overview.png",
+            "critic_weight_overview.png",
+            "actor_effective_weights.png",
+            "critic_effective_weights.png",
+        ],
         "usage": json.loads(json.dumps(usage)),
     }
 
@@ -696,6 +963,7 @@ def _write_outputs(
         output_path=output_dir / "branch_relative_usage.png",
         subtitle="Average actor/critic branch importance normalized by feature width",
     )
+    _generate_weight_visualizations(policy, layout, output_dir)
 
 
 def _checkpoint_custom_objects(checkpoint_path: Path, device: str) -> Dict[str, object]:
@@ -719,7 +987,7 @@ def analyze_checkpoint(
 
     layout = _make_observation_layout(model.policy)
     usage = _compute_policy_usage(model.policy, layout)
-    _write_outputs(checkpoint_path, output_dir, layout, usage)
+    _write_outputs(model.policy, checkpoint_path, output_dir, layout, usage)
     return layout, usage
 
 
@@ -1224,8 +1492,19 @@ def main() -> int:
             print(f"  {key:>14}: {value:6.2f}%")
         print()
         print("Observation layout:")
-        print(f"  pointcloud shape: {layout['pointcloud_shape']}")
+        print(f"  pointcloud raw shape: {layout['pointcloud_shape']}")
+        print(f"  pointcloud raw dims: {layout['raw_dims']['pointcloud']}")
+        print(
+            "  pointcloud encoded dims after PointNet: "
+            f"{layout['encoded_dims']['pointcloud']}"
+        )
+        print("  encoded dims used for attribution:")
+        for key, value in layout["encoded_dims"].items():
+            print(f"  {key:>14}: {value}")
+        print("  raw proprio dims:")
         for key, value in layout["raw_dims"].items():
+            if key == "pointcloud":
+                continue
             print(f"  {key:>14}: {value}")
 
     return 0
