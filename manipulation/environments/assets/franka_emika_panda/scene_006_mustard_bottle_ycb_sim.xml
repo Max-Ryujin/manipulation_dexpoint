@@ -44,7 +44,7 @@
       <inertial mass="0.431000" pos="0 0 0" diaginertia="0.00166831 0.00159482 0.00065973" />
       <geom name="target_object_visual" type="mesh" mesh="mesh_006_mustard_bottle" pos="0.000000 0.000000 0.000000" material="material_006_mustard_bottle" contype="0" conaffinity="0" />
       <geom name="target_object_collision" type="mesh" pos="0.000000 0.000000 0.000000" rgba="0 0 0 0" contype="2" conaffinity="1" condim="3" solimp="0.99 0.995 0.01" solref="0.01 1" friction="1 0.005 0.0001" mesh="mesh_006_mustard_bottle_collision" />
-      <site name="target_offset_site" pos="0 0 0.01" size="0.02" rgba="0.2 0.85 0.3 0.1" type="sphere" />
+      <site name="target_offset_site" pos="0 0.1 0.0" size="0.05" rgba="0.2 0.85 0.3 0.2" type="sphere" />
     </body>
   </worldbody>
 </mujoco>
