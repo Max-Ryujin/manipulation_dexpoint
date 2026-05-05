@@ -86,6 +86,7 @@ def build_environment(
     camera_height: int = 240,
     camera_width: int = 320,
     overlay_pointcloud: bool = False,
+    ycb_object_names: Optional[List[str]] = None,
 ) -> FrankaGymEnvironment:
     env = FrankaGymEnvironment(
         xml_path=None,
@@ -97,6 +98,7 @@ def build_environment(
         rate=200.0,
         frame_skip=10,
         visualize_pointclouds=overlay_pointcloud,
+        ycb_object_names=ycb_object_names,
     )
     env.configure_task(
         create_task_config(
@@ -210,6 +212,7 @@ def build_row(
         "phase_index": phase_index,
         "phase": phase.name,
         "phase_kind": phase.kind,
+        "active_object_name": env.get_active_object_name(),
         "sim_time": float(env.env.sim_time),
         "step_count": int(env.step_count),
         "controller_status": env.env.controller.get_status().value,
@@ -353,6 +356,8 @@ def run_episode(
     video_writer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     env.reset()
+    active_object_name = env.get_active_object_name()
+    print(f"[episode {episode_index}] active object: {active_object_name}")
     if video_writer is not None:
         frame = render_debug_frame(env, overlay_pointcloud=args.overlay_pointcloud)
         if frame is not None:
@@ -413,6 +418,7 @@ def run_episode(
             info["timed_out_phase"] = phase.name
             print(f"[episode {episode_index}] timeout in phase '{phase.name}' after {elapsed} steps")
             return {
+                "object_name": active_object_name,
                 "done": True,
                 "reward": reward,
                 "info": info,
@@ -425,6 +431,7 @@ def run_episode(
                 f"lift={info.get('target_lift', 0.0):.4f} success={info.get('is_success', False)}"
             )
             return {
+                "object_name": active_object_name,
                 "done": done,
                 "reward": reward,
                 "info": info,
@@ -439,6 +446,7 @@ def run_episode(
                     f"reward={reward:.4f} lift={info.get('target_lift', 0.0):.4f}"
                 )
                 return {
+                    "object_name": active_object_name,
                     "done": done,
                     "reward": reward,
                     "info": info,
@@ -535,6 +543,17 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Joint interpolation step size passed to the position controller",
     )
+    parser.add_argument(
+        "--ycb-object-names",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="OBJECT_NAME",
+        help=(
+            "List of YCB object folder names to randomly sample one from per episode "
+            "(e.g. 005_tomato_soup_can 006_mustard_bottle), matching training behavior."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -551,10 +570,13 @@ def main() -> None:
         camera_height=args.camera_height,
         camera_width=args.camera_width,
         overlay_pointcloud=args.overlay_pointcloud,
+        ycb_object_names=args.ycb_object_names,
     )
 
     print(f"Logging to {csv_path}")
     print(f"Saving video to {video_path}")
+    if args.ycb_object_names:
+        print(f"Using YCB object pool: {args.ycb_object_names}")
     try:
         with csv_path.open("w", newline="") as handle, imageio.get_writer(
             video_path,
@@ -585,7 +607,7 @@ def main() -> None:
             for index, summary in enumerate(summaries):
                 info = summary["info"]
                 print(
-                    f"episode={index} reward={summary['reward']:.4f} completed_phases={summary['completed_phases']} "
+                    f"episode={index} object={summary['object_name']} reward={summary['reward']:.4f} completed_phases={summary['completed_phases']} "
                     f"success={info.get('is_success', False)} lift={info.get('target_lift', 0.0):.4f}"
                 )
     finally:

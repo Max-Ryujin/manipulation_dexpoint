@@ -24,7 +24,13 @@ from dexart_baselines.stable_baselines3.common.save_util import load_from_zip_fi
 from dexart_baselines.stable_baselines3.ppo import PPO
 
 
-OBSERVATION_GROUP_KEYS = ["pointcloud", "joint_state", "ee_position", "goal_position"]
+OBSERVATION_GROUP_KEYS = [
+    "pointcloud",
+    "joint_state",
+    "ee_position",
+    "target_position",
+    "goal_position",
+]
 BRANCH_KEYS = ["pointcloud", "proprio"]
 
 
@@ -99,6 +105,11 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
         if "ee_position" in observation_space.spaces
         else 0
     )
+    target_dim = (
+        int(observation_space.spaces["target_position"].shape[0])
+        if "target_position" in observation_space.spaces
+        else 0
+    )
     goal_dim = (
         int(observation_space.spaces["goal_position"].shape[0])
         if "goal_position" in observation_space.spaces
@@ -115,8 +126,12 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
     if ee_dim > 0:
         proprio_slices["ee_position"] = slice(start, start + ee_dim)
         start += ee_dim
+    if target_dim > 0:
+        proprio_slices["target_position"] = slice(start, start + target_dim)
+        start += target_dim
     if goal_dim > 0:
         proprio_slices["goal_position"] = slice(start, start + goal_dim)
+        start += goal_dim
 
     feature_slices = OrderedDict(
         pointcloud=slice(0, pointcloud_feature_dim),
@@ -131,6 +146,7 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
             pointcloud=int(np.prod(pointcloud_shape)),
             joint_state=joint_dim,
             ee_position=ee_dim,
+            target_position=target_dim,
             goal_position=goal_dim,
         ),
         "pointcloud_feature_dim": pointcloud_feature_dim,
@@ -140,6 +156,7 @@ def _make_observation_layout(policy: nn.Module) -> Dict[str, object]:
             pointcloud=pointcloud_feature_dim,
             joint_state=joint_dim,
             ee_position=ee_dim,
+            target_position=target_dim,
             goal_position=goal_dim,
         ),
         "branch_analysis_dims": OrderedDict(
@@ -198,6 +215,9 @@ def _compute_policy_usage(
     actor_group_scores["ee_position"] = _sum_abs_columns(
         actor_raw_proprio, proprio_slices.get("ee_position", slice(0, 0))
     )
+    actor_group_scores["target_position"] = _sum_abs_columns(
+        actor_raw_proprio, proprio_slices.get("target_position", slice(0, 0))
+    )
     actor_group_scores["goal_position"] = _sum_abs_columns(
         actor_raw_proprio, proprio_slices.get("goal_position", slice(0, 0))
     )
@@ -211,6 +231,9 @@ def _compute_policy_usage(
     )
     critic_group_scores["ee_position"] = _sum_abs_columns(
         critic_raw_proprio, proprio_slices.get("ee_position", slice(0, 0))
+    )
+    critic_group_scores["target_position"] = _sum_abs_columns(
+        critic_raw_proprio, proprio_slices.get("target_position", slice(0, 0))
     )
     critic_group_scores["goal_position"] = _sum_abs_columns(
         critic_raw_proprio, proprio_slices.get("goal_position", slice(0, 0))
@@ -344,7 +367,7 @@ def _build_report(
         "Method:",
         "  - Loads the trained PPO policy and inspects trained weights only.",
         "  - Pointcloud usage is measured at the learned pointcloud feature branch.",
-        "  - joint_state / ee_position / goal_position usage is traced through the proprio MLP into actor and critic readouts.",
+        "  - joint_state / ee_position / target_position / goal_position usage is traced through the proprio MLP into actor and critic readouts.",
         "  - Absolute shares are based on effective linear weight mass, so they are an approximation of reliance, not a causal attribution.",
         "  - Relative importance shares divide each group's score by its analysis dimensionality before normalizing across groups.",
         "  - For pointcloud this uses learned pointcloud feature width, because the point encoder is nonlinear and the script does not trace attribution back to raw points.",
@@ -353,6 +376,7 @@ def _build_report(
         f"  - pointcloud: shape={layout['pointcloud_shape']} raw_dims={raw_dims['pointcloud']}",
         f"  - joint_state: dims={raw_dims['joint_state']}",
         f"  - ee_position: dims={raw_dims['ee_position']}",
+        f"  - target_position: dims={raw_dims['target_position']}",
         f"  - goal_position: dims={raw_dims['goal_position']}",
         f"  - pointcloud feature dim: {layout['pointcloud_feature_dim']}",
         f"  - proprio feature dim: {layout['proprio_feature_dim']}",
@@ -562,7 +586,7 @@ def _write_outputs(
             "grouping": OBSERVATION_GROUP_KEYS,
             "notes": [
                 "pointcloud scores reflect downstream reliance on the learned pointcloud feature branch",
-                "joint_state, ee_position, and goal_position are traced through the proprio MLP into actor and critic readouts",
+                "joint_state, ee_position, target_position, and goal_position are traced through the proprio MLP into actor and critic readouts",
                 "shares are normalized absolute effective weight magnitudes",
             ],
         },
@@ -852,7 +876,9 @@ def _draw_trend_chart(
 
 def _checkpoint_table_lines(results: Sequence[Mapping[str, object]]) -> List[str]:
     lines = []
-    header = "step        pointcloud  joint_state  ee_position  goal_position"
+    header = (
+        "step        pointcloud  joint_state  ee_position  target_position  goal_position"
+    )
     lines.append(header)
     lines.append("-" * len(header))
     for result in results:
@@ -862,6 +888,7 @@ def _checkpoint_table_lines(results: Sequence[Mapping[str, object]]) -> List[str
             f"{shares['pointcloud']:10.2f}  "
             f"{shares['joint_state']:11.2f}  "
             f"{shares['ee_position']:11.2f}  "
+            f"{shares['target_position']:15.2f}  "
             f"{shares['goal_position']:13.2f}"
         )
     return lines
@@ -1175,6 +1202,7 @@ def main() -> int:
                 f"pointcloud={shares['pointcloud']:.2f}% "
                 f"joint_state={shares['joint_state']:.2f}% "
                 f"ee_position={shares['ee_position']:.2f}% "
+                f"target_position={shares['target_position']:.2f}% "
                 f"goal_position={shares['goal_position']:.2f}%"
             )
     else:

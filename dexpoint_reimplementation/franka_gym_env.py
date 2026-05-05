@@ -40,6 +40,23 @@ class FrankaGymEnvironment(gym.Env):
 
     metadata = {"render_modes": []}
 
+    @staticmethod
+    def _quat_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float64)
+        quat_norm = float(np.linalg.norm(quat))
+        if quat_norm <= 0.0:
+            return np.eye(3, dtype=np.float64)
+
+        w, x, y, z = quat / quat_norm
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
     def __init__(
         self,
         xml_path: Optional[str] = None,
@@ -113,7 +130,12 @@ class FrankaGymEnvironment(gym.Env):
         self._rng = np.random.default_rng()
         self.goal_position: np.ndarray = np.zeros(3, dtype=np.float32)
 
-        self.ycb_object_root = Path(ycb_object_root).resolve()
+        requested_object_names = list(ycb_object_names or [])
+        resolved_ycb_object_root = Path(ycb_object_root).resolve()
+        if requested_object_names:
+            resolved_ycb_object_root = resolved_ycb_object_root.parent / requested_object_names[0]
+
+        self.ycb_object_root = resolved_ycb_object_root
         self.target_spec = load_ycb_object_spec(
             self.ycb_object_root,
             scale=self.target_scale,
@@ -165,36 +187,19 @@ class FrankaGymEnvironment(gym.Env):
         self.failure_xy_margin = 0.05
         self.failure_z_margin = 0.01
 
-        self._sample_goal_position()
+        # Task-specific attributes must exist before any initialization code
+        # consults task settings, including the initial goal sampling path.
+        self.task_config = {}
+        self.max_episode_steps = 200
+        self.step_count = 0
+        self.training_num_timesteps = 0
+        self.training_n_updates = 0
 
-        # Observation space: Dict with point cloud + joint state + ee_position + goal_position
-        self.observation_space = spaces.Dict(
-            {
-                "pointcloud": spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(num_points, 3), dtype=np.float32
-                ),
-                "joint_state": spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(self.joint_dim,), dtype=np.float32
-                ),
-                "ee_position": spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
-                ),
-                "goal_position": spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
-                ),
-            }
-        )
+        self.observation_space = self._build_observation_space()
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.robot_dof,), dtype=np.float32
         )
-
-        # Task-specific attributes
-        self.task_config = {}
-        self.max_episode_steps = 700
-        self.step_count = 0
-        self.training_num_timesteps = 0
-        self.training_n_updates = 0
 
         self._last_valid_observation = self._create_empty_observation()
         self._last_pointcloud_empty = False
@@ -209,10 +214,9 @@ class FrankaGymEnvironment(gym.Env):
         self._object_runtime_cache: Dict[int, Dict[str, Any]] = {}
         self._active_object_pool_index: int = 0
         self._fixed_object_pool_index: Optional[int] = None
-        if ycb_object_names and len(ycb_object_names) > 1:
+        if requested_object_names and len(requested_object_names) > 1:
             pool: List[Dict] = []
-            initial_pool_index: Optional[int] = None
-            for name in ycb_object_names:
+            for index, name in enumerate(requested_object_names):
                 obj_root = self.ycb_object_root.parent / name
                 xml_path_p, obj_spec = ensure_single_object_ycb_scene(
                     obj_root,
@@ -227,18 +231,9 @@ class FrankaGymEnvironment(gym.Env):
                         "object_spec": obj_spec,
                     }
                 )
-                # Find which pool entry matches the initially loaded object.
-                if name == self.ycb_object_root.name:
-                    initial_pool_index = len(pool) - 1
             self._ycb_object_pool = pool
-            if initial_pool_index is not None:
-                self._active_object_pool_index = initial_pool_index
-                self._object_runtime_cache[initial_pool_index] = (
-                    self._capture_current_runtime_bundle()
-                )
-            else:
-                self._close_runtime_bundle(self._capture_current_runtime_bundle())
-                self._switch_runtime_for_object(0)
+            self._active_object_pool_index = 0
+            self._object_runtime_cache[0] = self._capture_current_runtime_bundle()
 
     # ------------------------------------------------------------------
     # Multi-object helpers
@@ -399,8 +394,7 @@ class FrankaGymEnvironment(gym.Env):
             self.env.step()
 
         target_pos = self.get_target_position()
-        self.target_rest_height = float(target_pos[2])
-        self._sample_goal_position(target_position=target_pos)
+        self._reset_episode_goal_position(target_position=target_pos)
 
         self.step_count = 0
 
@@ -417,13 +411,43 @@ class FrankaGymEnvironment(gym.Env):
         self._rng = np.random.default_rng(seed)
         return [seed]
 
+    def _current_task_name(self) -> str:
+        return str(self.task_config.get("task_name", self.task_name))
+
+    def _task_uses_goal_position(self) -> bool:
+        return self._current_task_name() == "placing_v2"
+
+    def _build_observation_space(self) -> spaces.Dict:
+        observation_dict: Dict[str, spaces.Space] = {
+            "pointcloud": spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self.num_points, 3), dtype=np.float32
+            ),
+            "joint_state": spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self.joint_dim,), dtype=np.float32
+            ),
+            "ee_position": spaces.Box(
+                low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+            ),
+            "target_position": spaces.Box(
+                low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+            ),
+        }
+        if self._task_uses_goal_position():
+            observation_dict["goal_position"] = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+            )
+        return spaces.Dict(observation_dict)
+
     def _create_empty_observation(self) -> Dict[str, np.ndarray]:
-        return {
+        observation = {
             "pointcloud": np.zeros((self.num_points, 3), dtype=np.float32),
             "joint_state": np.zeros((self.joint_dim,), dtype=np.float32),
             "ee_position": np.zeros((3,), dtype=np.float32),
-            "goal_position": np.zeros((3,), dtype=np.float32),
+            "target_position": np.zeros((3,), dtype=np.float32),
         }
+        if self._task_uses_goal_position():
+            observation["goal_position"] = np.zeros((3,), dtype=np.float32)
+        return observation
 
     def _reset_target_pose(self) -> None:
         bounds = self.workspace_bounds
@@ -463,11 +487,34 @@ class FrankaGymEnvironment(gym.Env):
         self.env.reset_velocities()
         self.env.forward()
 
-    def _sample_goal_position(
+    def _reset_episode_goal_position(
         self, target_position: Optional[np.ndarray] = None
     ) -> None:
+        if self._task_uses_goal_position():
+            # Sample a random placing goal on the table inside the workspace.
+            bounds = self.workspace_bounds
+            placement_margin = float(self.target_spec.placement_radius)
+            min_x = bounds["min_x"] + placement_margin
+            max_x = bounds["max_x"] - placement_margin
+            min_y = bounds["min_y"] + placement_margin
+            max_y = bounds["max_y"] - placement_margin
 
-        return np.asarray(target_position, dtype=np.float32).copy()
+            goal_z = self.table_height + float(self.target_spec.rest_offset_z)
+
+            # Try to keep the goal at least 15 cm away from the object start
+            # position so the policy has to actually move the object.
+            min_separation = 0.15
+            for _ in range(20):
+                gx = float(self._rng.uniform(min_x, max_x))
+                gy = float(self._rng.uniform(min_y, max_y))
+                if target_position is None:
+                    break
+                if float(np.hypot(gx - target_position[0], gy - target_position[1])) >= min_separation:
+                    break
+
+            self.goal_position = np.array([gx, gy, goal_z], dtype=np.float32)
+        else:
+            self.goal_position = np.zeros(3, dtype=np.float32)
 
     def get_target_position(self) -> np.ndarray:
         # check if target_offset_site exists in the model, if so use its position as the target position, otherwise fall back to using the target body's position
@@ -480,11 +527,43 @@ class FrankaGymEnvironment(gym.Env):
         else:
             return self.env.get_object_position(self.target_body_name)
 
+    def _get_target_collision_half_extents(self) -> np.ndarray:
+        collision_geom_type = str(self.target_spec.collision_geom_type)
+        collision_size = np.asarray(self.target_spec.collision_size, dtype=np.float64)
+        if collision_geom_type == "cylinder":
+            radius = float(collision_size[0])
+            half_height = float(collision_size[1])
+            return np.array([radius, radius, half_height], dtype=np.float64)
+        if collision_geom_type in {"box", "mesh"}:
+            return collision_size.astype(np.float64)
+        raise ValueError(
+            f"Unsupported collision geometry type: {collision_geom_type}"
+        )
+
+    def get_target_bottom_height(self) -> float:
+        target_pos, target_quat = self.env.get_object_pose(self.target_body_name)
+        if target_pos is None or target_quat is None:
+            target_pos = self.env.get_object_position(self.target_body_name)
+            return float(target_pos[2] - self.target_spec.rest_offset_z)
+
+        rotation = self._quat_to_rotation_matrix(target_quat)
+        collision_center = np.asarray(self.target_spec.collision_pos, dtype=np.float64)
+        half_extents = self._get_target_collision_half_extents()
+        world_collision_center = np.asarray(target_pos, dtype=np.float64) + rotation @ collision_center
+        vertical_radius = float(np.dot(np.abs(rotation[2, :]), half_extents))
+        return float(world_collision_center[2] - vertical_radius)
+
+    def get_target_lift_height(self) -> float:
+        return float(max(self.get_target_bottom_height() - self.table_height, 0.0))
+
+    def is_target_below_table(self, margin: float = 0.0) -> bool:
+        return bool(self.get_target_bottom_height() < (self.table_height - margin))
+
     def _get_viewer_debug_markers(self) -> List[Dict[str, Any]]:
         target_pos = self.get_target_position().astype(np.float64)
         offset_target_pos = target_pos + np.array([0.0, 0.0, 0.01], dtype=np.float64)
         marker_radius = 0.008
-        return [
+        markers = [
             {
                 "pos": target_pos,
                 "size": np.array([marker_radius, marker_radius, marker_radius]),
@@ -496,6 +575,16 @@ class FrankaGymEnvironment(gym.Env):
                 "rgba": np.array([0.2, 0.85, 0.3, 0.85]),
             },
         ]
+        if self._task_uses_goal_position():
+            goal_pos = self.goal_position.astype(np.float64)
+            markers.append(
+                {
+                    "pos": goal_pos,
+                    "size": np.array([0.02, 0.02, 0.005]),
+                    "rgba": np.array([0.1, 0.4, 1.0, 0.9]),
+                }
+            )
+        return markers
 
     def get_target_pose(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.env.get_object_pose(self.target_body_name)
@@ -762,12 +851,15 @@ class FrankaGymEnvironment(gym.Env):
             self._last_pointcloud_empty = True
             joint_state = self.env.data.qpos[: self.robot_dof].astype(np.float32)
             ee_position = self.get_end_effector_position()
+            target_position = self.get_target_position()
             fallback_obs = {
                 "pointcloud": self._last_valid_observation["pointcloud"].copy(),
                 "joint_state": joint_state,
                 "ee_position": ee_position,
-                "goal_position": self.goal_position.copy(),
+                "target_position": target_position,
             }
+            if self._task_uses_goal_position():
+                fallback_obs["goal_position"] = self.goal_position.copy()
             if timing_stats is not None:
                 timing_stats["obs_total_s"] = timing_stats.get("obs_total_s", 0.0) + (
                     time.perf_counter() - observation_start
@@ -793,19 +885,24 @@ class FrankaGymEnvironment(gym.Env):
 
         # Extract end-effector position and stable goal position
         ee_position = self.get_end_effector_position()
+        target_position = self.get_target_position()
 
         obs = {
             "pointcloud": pointcloud,
             "joint_state": joint_state,
             "ee_position": ee_position,
-            "goal_position": self.goal_position.copy(),
+            "target_position": target_position,
         }
+        if self._task_uses_goal_position():
+            obs["goal_position"] = self.goal_position.copy()
         self._last_valid_observation = {
             "pointcloud": pointcloud.copy(),
             "joint_state": joint_state.copy(),
             "ee_position": ee_position.copy(),
-            "goal_position": self.goal_position.copy(),
+            "target_position": target_position.copy(),
         }
+        if self._task_uses_goal_position():
+            self._last_valid_observation["goal_position"] = self.goal_position.copy()
         if timing_stats is not None:
             timing_stats["obs_total_s"] = timing_stats.get("obs_total_s", 0.0) + (
                 time.perf_counter() - observation_start
@@ -888,6 +985,10 @@ class FrankaGymEnvironment(gym.Env):
         self.randomize_target_pose = task_config.get(
             "randomize_target_pose", self.randomize_target_pose
         )
+        self.observation_space = self._build_observation_space()
+        if not self._task_uses_goal_position():
+            self.goal_position = np.zeros(3, dtype=np.float32)
+        self._last_valid_observation = self._create_empty_observation()
 
     def set_task_reward(self, reward_fn):
         """Set a custom reward function."""

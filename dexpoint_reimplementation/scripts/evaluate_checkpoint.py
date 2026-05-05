@@ -241,7 +241,7 @@ def get_target_table_contact(env: FrankaGymEnvironment) -> bool:
 
 def get_target_table_distance(env: FrankaGymEnvironment) -> float:
     """Return the current target clearance above the table."""
-    return float(max(env.get_target_position()[2] - env.target_rest_height, 0.0))
+    return float(env.get_target_lift_height())
 
 
 def get_episode_end_reason(info: Dict[str, Any]) -> str:

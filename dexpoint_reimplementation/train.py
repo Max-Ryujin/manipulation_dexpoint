@@ -379,6 +379,8 @@ def train_dexpoint(
             project_name = "dexpoint-franka_lifting"
         elif task_name == "placing":
             project_name = "dexpoint-franka_placing"
+        elif task_name == "placing_v2":
+            project_name = "dexpoint-franka_placing"
         else:
             project_name = "dexpoint-franka"
         wandb.init(
@@ -789,13 +791,6 @@ def train_dexpoint(
                         validation_scalar_logs[
                             f"validation/{object_metric_key}/episode_success"
                         ] = float(success)
-                        validation_media_logs[
-                            f"validation/plots/{object_metric_key}/try_{eval_try_index:02d}"
-                        ] = (
-                            wandb.Image(str(plot_path))
-                            if use_wandb and wandb.run is not None
-                            else None
-                        )
 
                         if video_frames:
                             try:
@@ -945,7 +940,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping", "reaching", "lifting", "lifting_only", "placing"],
+        choices=["grasping", "reaching", "lifting", "lifting_only", "placing", "placing_v2"],
         help="Task to train on",
     )
     parser.add_argument(
@@ -1055,6 +1050,12 @@ def main():
             "YCB_sim scene files for each name."
         ),
     )
+    parser.add_argument(
+        "--rollout-size",
+        type=int,
+        default=10000,
+        help="Number of steps per rollout.",
+    )
 
     args = parser.parse_args()
 
@@ -1066,6 +1067,7 @@ def main():
         learning_rate=args.lr,
         batch_size=args.batch_size,
         n_epochs=args.epochs,
+        n_steps=args.rollout_size,
         verbose=args.verbose,
         use_wandb=args.wandb,
         record_video=args.record_video,
