@@ -415,7 +415,7 @@ class FrankaGymEnvironment(gym.Env):
         return str(self.task_config.get("task_name", self.task_name))
 
     def _task_uses_goal_position(self) -> bool:
-        return self._current_task_name() == "placing_v2"
+        return self._current_task_name() in {"placing_v2", "placing_v3"}
 
     def _build_observation_space(self) -> spaces.Dict:
         observation_dict: Dict[str, spaces.Space] = {
@@ -556,7 +556,7 @@ class FrankaGymEnvironment(gym.Env):
     def get_target_lift_height(self) -> float:
         return float(max(self.get_target_bottom_height() - self.table_height, 0.0))
 
-    def is_target_below_table(self, margin: float = 0.0) -> bool:
+    def is_target_below_table(self, margin: float = 0.05) -> bool:
         return bool(self.get_target_bottom_height() < (self.table_height - margin))
 
     def _get_viewer_debug_markers(self) -> List[Dict[str, Any]]:

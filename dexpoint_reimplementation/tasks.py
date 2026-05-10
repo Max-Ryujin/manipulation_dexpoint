@@ -4,6 +4,8 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
+from placing_v3_task import build_placing_v3_task
+
 
 class ReachingTask:
     """End-effector reaching task configuration."""
@@ -346,7 +348,7 @@ class PlacingTask:
     POST_LIFT_DISTANCE_PENALTY_SCALE = 4.0
     POST_LIFT_TABLE_CONTACT_REWARD = 0.05
     OFF_TABLE_PENALTY_SCALE = 10.0
-    CAN_FALL_THRESHOLD = 0.03
+    CAN_FALL_THRESHOLD = 0.05
 
     @staticmethod
     def _update_post_lift_phase(env, target_table_distance: float) -> bool:
@@ -439,7 +441,7 @@ class PlacingTask:
         if post_lift_phase_active:
             bonus_reward = 0.0
             bonus_reward_active = False
-            table_distance_reward = 0.0
+            table_distance_reward = -0.1
             post_lift_distance_penalty = (
                 -post_lift_distance_penalty_scale
                 * shared_terms["target_table_distance"]
@@ -581,12 +583,10 @@ class GraspingTask:
     SUCCESS_BONUS = 0.5
     TIME_PENALTY = 1e-3
     FAILURE_PENALTY = -1.0
-    FAILURE_XY_MARGIN = 0.05
-    FAILURE_Z_MARGIN = 0.01
     REACHING_ONLY_END_STEP = 500_000
     CLOSE_REWARD_FULL_STEP = 2_200_000
     LIFTING_BLEND_FULL_STEP = 3_500_000
-    CLOSE_REWARD_DECAY_END_STEP = 12_000_000
+    CLOSE_REWARD_DECAY_END_STEP = 20_000_000
     BONUS_REWARD_FULL_BOOST_STEP = 20_000_000
     TABLE_DISTANCE_FULL_BOOST_STEP = 20_000_000
     MAX_BONUS_WEIGHT = 2.0
@@ -949,8 +949,6 @@ class GraspingTask:
             "success_bonus": 0.0,
             "time_penalty": GraspingTask.TIME_PENALTY,
             "failure_penalty": GraspingTask.FAILURE_PENALTY,
-            "failure_xy_margin": GraspingTask.FAILURE_XY_MARGIN,
-            "failure_z_margin": GraspingTask.FAILURE_Z_MARGIN,
             "reaching_only_end_step": GraspingTask.REACHING_ONLY_END_STEP,
             "close_reward_full_step": GraspingTask.CLOSE_REWARD_FULL_STEP,
             "lifting_blend_full_step": GraspingTask.LIFTING_BLEND_FULL_STEP,
@@ -1319,12 +1317,19 @@ class PlacingV2Task:
         return float(reward), is_success, info
 
 
+PlacingV3Task = build_placing_v3_task(
+    ReachingTask,
+    LiftingTask,
+    GraspingTask,
+)
+
+
 def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
     """
     Create a task configuration by name.
 
     Args:
-        task_name: 'grasping', 'reaching', 'lifting', 'lifting_only', or 'placing'
+        task_name: 'grasping', 'reaching', 'lifting', 'lifting_only', 'placing', 'placing_v2', or 'placing_v3'
         **kwargs: Additional parameters to override defaults
 
     Returns:
@@ -1342,6 +1347,8 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
         config = PlacingTask.get_default_config()
     elif task_name == "placing_v2":
         config = PlacingV2Task.get_default_config()
+    elif task_name == "placing_v3":
+        config = PlacingV3Task.get_default_config()
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
@@ -1373,6 +1380,11 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
     elif task_name == "placing_v2":
         if reward_variant in {"default", "placing_v2"}:
             config["reward_fn"] = PlacingV2Task.reward_function
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif task_name == "placing_v3":
+        if reward_variant in {"default", "placing_v3"}:
+            config["reward_fn"] = PlacingV3Task.reward_function
         else:
             raise ValueError(f"Unknown reward variant: {reward_variant}")
     elif reward_variant in {"default", "reaching"}:
