@@ -158,7 +158,7 @@ def collect_fused_pointcloud_for_training(
     min_height_above_table: float = 0.01,
     hand_sphere_radius: float = 0.12,
     timing_stats: Optional[dict[str, float]] = None,
-    cache_steps: int = 1,
+    cache_steps: int = 0,
     cache_state: Optional[dict[str, object]] = None,
 ) -> np.ndarray:
     """Collect a fused point cloud for training using depth only.

@@ -381,6 +381,8 @@ def train_dexpoint(
             project_name = "dexpoint-franka_placing"
         elif task_name == "placing_v2":
             project_name = "dexpoint-franka_placing"
+        elif task_name == "placing_v3":
+            project_name = "dexpoint-franka_placing"
         else:
             project_name = "dexpoint-franka"
         wandb.init(
@@ -940,7 +942,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping", "reaching", "lifting", "lifting_only", "placing", "placing_v2"],
+        choices=["grasping", "reaching", "lifting", "lifting_only", "placing", "placing_v2", "placing_v3"],
         help="Task to train on",
     )
     parser.add_argument(
@@ -957,11 +959,11 @@ def main():
         help="Number of parallel training environments.",
     )
     parser.add_argument("--steps", type=int, default=10000, help="Total training steps")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument(
-        "--batch-size", type=int, default=64, help="Batch size for PPO updates"
+        "--batch-size", type=int, default=128, help="Batch size for PPO updates"
     )
-    parser.add_argument("--epochs", type=int, default=10, help="Epochs per PPO update")
+    parser.add_argument("--epochs", type=int, default=6, help="Epochs per PPO update")
     parser.add_argument(
         "--verbose", type=int, default=1, choices=[0, 1], help="Verbosity level"
     )
