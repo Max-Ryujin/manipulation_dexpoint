@@ -279,12 +279,53 @@ def _find_named_asset(
     return None
 
 
+def _find_named_child(
+    parent: ET.Element, element_type: str, name: str
+) -> Optional[ET.Element]:
+    for element in parent.findall(element_type):
+        if element.get("name") == name:
+            return element
+    return None
+
+
 def _default_scene_path(object_spec: YCBObjectSpec) -> Path:
     if object_spec.source == YCB_ASSET_SOURCE_YCB_SIM:
         return (
             _GENERATED_SCENE_DIR / f"scene_{object_spec.name}_{object_spec.source}.xml"
         )
     return _GENERATED_SCENE_DIR / f"scene_{object_spec.name}.xml"
+
+
+def ensure_goal_position_site(scene_path: Union[str, Path]) -> Path:
+    """Ensure the scene XML contains a hidden world-frame site for goal visualization."""
+    resolved_scene_path = Path(scene_path)
+    tree = ET.parse(resolved_scene_path)
+    root = tree.getroot()
+    worldbody = _require_element(root, ".//worldbody")
+
+    goal_site = _find_named_child(worldbody, "site", "goal_position_site")
+    if goal_site is None:
+        goal_site = ET.SubElement(worldbody, "site")
+
+    desired_attributes = {
+        "name": "goal_position_site",
+        "pos": "0 0 0",
+        "size": "0.02 0.02 0.005",
+        "type": "cylinder",
+        "rgba": "0.1 0.4 1 0",
+    }
+
+    needs_write = False
+    for key, value in desired_attributes.items():
+        if goal_site.get(key) != value:
+            goal_site.set(key, value)
+            needs_write = True
+
+    if needs_write:
+        if hasattr(ET, "indent"):
+            ET.indent(tree, space="  ")
+        tree.write(resolved_scene_path, encoding="utf-8", xml_declaration=False)
+    return resolved_scene_path
 
 
 def _load_raw_ycb_object_spec(object_root: Path, scale: float = 1.0) -> YCBObjectSpec:
@@ -585,4 +626,5 @@ def ensure_single_object_ycb_scene(
     """Create the single-object scene for the requested YCB object if missing."""
     object_spec = load_ycb_object_spec(object_root, scale=scale, source=source)
     xml_path = create_single_object_ycb_scene(object_spec, scene_path=scene_path)
+    ensure_goal_position_site(xml_path)
     return xml_path, object_spec

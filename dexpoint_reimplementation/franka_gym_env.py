@@ -29,6 +29,7 @@ from ycb_scene import (
     DEFAULT_YCB_OBJECT_ROOT,
     YCB_ASSET_SOURCE_YCB_SIM,
     ensure_single_object_ycb_scene,
+    ensure_goal_position_site,
     load_ycb_object_spec,
 )
 
@@ -150,7 +151,7 @@ class FrankaGymEnvironment(gym.Env):
             )
             self.xml_path = scene_xml_path.as_posix()
         else:
-            self.xml_path = xml_path
+            self.xml_path = ensure_goal_position_site(xml_path).as_posix()
 
         # Set default camera names if not provided
         if camera_names is None:
@@ -166,6 +167,7 @@ class FrankaGymEnvironment(gym.Env):
         self.camera = MujocoCamera(self.env, width=camera_width, height=camera_height)
         self.hand_body_id = self.env.model.body("hand").id
         self.attachment_site_id = self.env.model.site("attachment_site").id
+        self.goal_position_site_id = self.env.model.site("goal_position_site").id
 
         self.ctrl_min = self.env.model.actuator_ctrlrange[: self.robot_dof, 0]
         self.ctrl_max = self.env.model.actuator_ctrlrange[: self.robot_dof, 1]
@@ -246,6 +248,7 @@ class FrankaGymEnvironment(gym.Env):
             "camera": self.camera,
             "hand_body_id": self.hand_body_id,
             "attachment_site_id": self.attachment_site_id,
+            "goal_position_site_id": self.goal_position_site_id,
             "ctrl_min": self.ctrl_min,
             "ctrl_max": self.ctrl_max,
             "gripper_ctrl_min": self.gripper_ctrl_min,
@@ -265,7 +268,9 @@ class FrankaGymEnvironment(gym.Env):
     def _create_runtime_bundle(self, pool_index: int) -> Dict[str, Any]:
         """Create a reusable MuJoCo runtime bundle for one object in the pool."""
         entry = self._ycb_object_pool[pool_index]
-        env = FrankaEnvironment(entry["xml_path"], rate=self.rate, frame_skip=self.frame_skip)
+        xml_path = ensure_goal_position_site(entry["xml_path"]).as_posix()
+        entry["xml_path"] = xml_path
+        env = FrankaEnvironment(xml_path, rate=self.rate, frame_skip=self.frame_skip)
         env.set_viewer_marker_callback(self._get_viewer_debug_markers)
         camera = MujocoCamera(env, width=self.camera_width, height=self.camera_height)
         workspace_bounds, workspace_info = get_workspace_configuration(env.model)
@@ -278,6 +283,7 @@ class FrankaGymEnvironment(gym.Env):
             "camera": camera,
             "hand_body_id": env.model.body("hand").id,
             "attachment_site_id": env.model.site("attachment_site").id,
+            "goal_position_site_id": env.model.site("goal_position_site").id,
             "ctrl_min": ctrl_min,
             "ctrl_max": ctrl_max,
             "gripper_ctrl_min": float(ctrl_min[7]),
@@ -300,6 +306,7 @@ class FrankaGymEnvironment(gym.Env):
         self.camera = bundle["camera"]
         self.hand_body_id = bundle["hand_body_id"]
         self.attachment_site_id = bundle["attachment_site_id"]
+        self.goal_position_site_id = bundle["goal_position_site_id"]
         self.ctrl_min = bundle["ctrl_min"]
         self.ctrl_max = bundle["ctrl_max"]
         self.gripper_ctrl_min = bundle["gripper_ctrl_min"]
@@ -315,6 +322,7 @@ class FrankaGymEnvironment(gym.Env):
         self.ycb_object_root = bundle["ycb_object_root"]
         self.xml_path = bundle["xml_path"]
         self._active_object_pool_index = pool_index
+        self._sync_goal_position_site()
 
     def _close_runtime_bundle(self, bundle: Dict[str, Any]) -> None:
         """Release renderer and viewer resources held by a runtime bundle."""
@@ -515,6 +523,16 @@ class FrankaGymEnvironment(gym.Env):
             self.goal_position = np.array([gx, gy, goal_z], dtype=np.float32)
         else:
             self.goal_position = np.zeros(3, dtype=np.float32)
+        self._sync_goal_position_site()
+
+    def _sync_goal_position_site(self) -> None:
+        goal_site_pos = self.goal_position.astype(np.float64)
+        self.env.model.site_pos[self.goal_position_site_id] = goal_site_pos
+        goal_site_rgba = self.env.model.site_rgba[self.goal_position_site_id]
+        goal_site_rgba[:] = np.array([0.1, 0.4, 1.0, 0.85], dtype=np.float32)
+        if not self._task_uses_goal_position():
+            goal_site_rgba[3] = 0.0
+        self.env.forward()
 
     def get_target_position(self) -> np.ndarray:
         # check if target_offset_site exists in the model, if so use its position as the target position, otherwise fall back to using the target body's position
