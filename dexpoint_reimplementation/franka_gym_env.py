@@ -130,6 +130,7 @@ class FrankaGymEnvironment(gym.Env):
         self.goal_height_range = goal_height_range
         self._rng = np.random.default_rng()
         self.goal_position: np.ndarray = np.zeros(3, dtype=np.float32)
+        self.virtual_target_position: np.ndarray = np.zeros(3, dtype=np.float32)
 
         requested_object_names = list(ycb_object_names or [])
         resolved_ycb_object_root = Path(ycb_object_root).resolve()
@@ -394,12 +395,15 @@ class FrankaGymEnvironment(gym.Env):
         self.env.reset()
         self.env.clear_collision_exceptions()
 
+
         if self.randomize_target_pose:
             self._reset_target_pose()
 
         # Step a few times to settle simulation
         for _ in range(5):
             self.env.step()
+
+        self._reset_virtual_target_position()
 
         target_pos = self.get_target_position()
         self._reset_episode_goal_position(target_position=target_pos)
@@ -422,8 +426,22 @@ class FrankaGymEnvironment(gym.Env):
     def _current_task_name(self) -> str:
         return str(self.task_config.get("task_name", self.task_name))
 
+    def _task_uses_virtual_target(self) -> bool:
+        return bool(self.task_config.get("use_virtual_target", False))
+
     def _task_uses_goal_position(self) -> bool:
         return self._current_task_name() in {"placing_v2", "placing_v3"}
+
+    def _get_virtual_target_workspace_bounds(self) -> Dict[str, float]:
+        expand_x = float(self.task_config.get("virtual_target_workspace_expand_x", 0.0))
+        expand_y = float(self.task_config.get("virtual_target_workspace_expand_y", 0.0))
+        return {
+            "min_x": float(self.workspace_bounds["min_x"] - expand_x),
+            "max_x": float(self.workspace_bounds["max_x"] + expand_x),
+            "min_y": float(self.workspace_bounds["min_y"] - expand_y),
+            "max_y": float(self.workspace_bounds["max_y"] + expand_y),
+            "table_height": float(self.workspace_bounds["table_height"]),
+        }
 
     def _build_observation_space(self) -> spaces.Dict:
         observation_dict: Dict[str, spaces.Space] = {
@@ -456,6 +474,63 @@ class FrankaGymEnvironment(gym.Env):
         if self._task_uses_goal_position():
             observation["goal_position"] = np.zeros((3,), dtype=np.float32)
         return observation
+
+    def _reset_virtual_target_position(self) -> None:
+        if not self._task_uses_virtual_target():
+            self.virtual_target_position = np.zeros(3, dtype=np.float32)
+            return
+
+        bounds = self._get_virtual_target_workspace_bounds()
+        min_height, max_height = self.task_config.get(
+            "virtual_target_height_range", (0.02, 0.3)
+        )
+        min_height = float(min_height)
+        max_height = float(max_height)
+        if max_height < min_height:
+            min_height, max_height = max_height, min_height
+
+        reference_ee_pos = self.get_end_effector_position().astype(np.float64)
+        min_distance = float(
+            self.task_config.get("virtual_target_min_distance_from_reset_ee", 0.0)
+        )
+        sample_attempts = int(self.task_config.get("virtual_target_sample_attempts", 64))
+        best_candidate = None
+        best_candidate_distance = -np.inf
+
+        for _ in range(max(sample_attempts, 1)):
+            candidate = np.array(
+                [
+                    self._rng.uniform(bounds["min_x"], bounds["max_x"]),
+                    self._rng.uniform(bounds["min_y"], bounds["max_y"]),
+                    self.table_height + self._rng.uniform(min_height, max_height),
+                ],
+                dtype=np.float64,
+            )
+            candidate_distance = float(np.linalg.norm(candidate - reference_ee_pos))
+            if candidate_distance > best_candidate_distance:
+                best_candidate = candidate
+                best_candidate_distance = candidate_distance
+            if candidate_distance >= min_distance:
+                self.virtual_target_position = candidate.astype(np.float32)
+                return
+
+        if best_candidate is not None:
+            self.virtual_target_position = best_candidate.astype(np.float32)
+            return
+
+        fallback = np.array(
+            [
+                np.clip(reference_ee_pos[0], bounds["min_x"], bounds["max_x"]),
+                np.clip(reference_ee_pos[1], bounds["min_y"], bounds["max_y"]),
+                np.clip(
+                    reference_ee_pos[2],
+                    self.table_height + min_height,
+                    self.table_height + max_height,
+                ),
+            ],
+            dtype=np.float64,
+        )
+        self.virtual_target_position = fallback.astype(np.float32)
 
     def _reset_target_pose(self) -> None:
         bounds = self.workspace_bounds
@@ -535,6 +610,9 @@ class FrankaGymEnvironment(gym.Env):
         self.env.forward()
 
     def get_target_position(self) -> np.ndarray:
+        if self._task_uses_virtual_target():
+            return self.virtual_target_position.copy()
+
         # check if target_offset_site exists in the model, if so use its position as the target position, otherwise fall back to using the target body's position
         if self.env.model.site("target_offset_site") is not None:
             return (
@@ -1006,6 +1084,8 @@ class FrankaGymEnvironment(gym.Env):
         self.observation_space = self._build_observation_space()
         if not self._task_uses_goal_position():
             self.goal_position = np.zeros(3, dtype=np.float32)
+        if not self._task_uses_virtual_target():
+            self.virtual_target_position = np.zeros(3, dtype=np.float32)
         self._last_valid_observation = self._create_empty_observation()
 
     def set_task_reward(self, reward_fn):

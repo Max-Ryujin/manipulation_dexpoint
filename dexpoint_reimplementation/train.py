@@ -373,6 +373,8 @@ def train_dexpoint(
         project_name = ""
         if task_name == "reaching":
             project_name = "dexpoint-franka_reaching"
+        elif task_name == "pretraining":
+            project_name = "dexpoint-franka_pretraining"
         elif task_name == "lifting":
             project_name = "dexpoint-franka_lifting"
         elif task_name == "lifting_only":
@@ -942,7 +944,7 @@ def main():
         "--task",
         type=str,
         default="grasping",
-        choices=["grasping", "reaching", "lifting", "lifting_only", "placing", "placing_v2", "placing_v3"],
+        choices=["grasping", "reaching", "pretraining", "lifting", "lifting_only", "placing", "placing_v2", "placing_v3"],
         help="Task to train on",
     )
     parser.add_argument(

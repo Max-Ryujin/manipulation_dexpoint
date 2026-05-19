@@ -633,7 +633,7 @@ def parse_args() -> argparse.Namespace:
         "--task",
         type=str,
         default=None,
-        choices=["grasping", "reaching", "lifting", "placing"],
+        choices=["grasping", "reaching", "pretraining", "lifting", "placing"],
         help="Task name. If omitted, the script tries to read it from config.json.",
     )
     parser.add_argument(

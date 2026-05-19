@@ -139,6 +139,62 @@ class ReachingTask:
 
         return float(reward), is_success, info
 
+
+class PretrainingTask:
+    """Virtual-point reaching pretraining for end-effector control."""
+
+    NAME = "pretraining"
+    TARGET_OBJECT = "target_object"
+    MAX_EPISODE_STEPS = 100
+    EE_DISTANCE_REWARD_SCALE = 1.0
+    VIRTUAL_TARGET_HEIGHT_RANGE = (0.02, 0.30)
+    VIRTUAL_TARGET_WORKSPACE_EXPAND_X = 0.08
+    VIRTUAL_TARGET_WORKSPACE_EXPAND_Y = 0.08
+    VIRTUAL_TARGET_MIN_DISTANCE_FROM_RESET_EE = 0.12
+
+    @staticmethod
+    def get_default_config() -> Dict[str, Any]:
+        return {
+            "max_episode_steps": PretrainingTask.MAX_EPISODE_STEPS,
+            "randomize_target_pose": False,
+            "reward_fn": PretrainingTask.reward_function,
+            "reward_variant": "default",
+            "task_name": PretrainingTask.NAME,
+            "target_body_name": PretrainingTask.TARGET_OBJECT,
+            "use_virtual_target": True,
+            "ee_distance_reward_scale": PretrainingTask.EE_DISTANCE_REWARD_SCALE,
+            "virtual_target_height_range": PretrainingTask.VIRTUAL_TARGET_HEIGHT_RANGE,
+            "virtual_target_workspace_expand_x": PretrainingTask.VIRTUAL_TARGET_WORKSPACE_EXPAND_X,
+            "virtual_target_workspace_expand_y": PretrainingTask.VIRTUAL_TARGET_WORKSPACE_EXPAND_Y,
+            "virtual_target_min_distance_from_reset_ee": PretrainingTask.VIRTUAL_TARGET_MIN_DISTANCE_FROM_RESET_EE,
+            "terminate_on_target_drop": False,
+            "terminate_on_target_escape": False,
+        }
+
+    @staticmethod
+    def reward_function(env) -> Tuple[float, bool, Dict[str, Any]]:
+        target_pos = env.get_target_position()
+        ee_pos = env.get_end_effector_position()
+        ee_distance = float(np.linalg.norm(target_pos - ee_pos))
+        reward_scale = float(
+            env.task_config.get(
+                "ee_distance_reward_scale",
+                PretrainingTask.EE_DISTANCE_REWARD_SCALE,
+            )
+        )
+
+        reward = -reward_scale * ee_distance
+        info = {
+            "task": PretrainingTask.NAME,
+            "step": env.step_count,
+            "ee_distance": ee_distance,
+            "distance_reward": float(reward),
+            "reward_total": float(reward),
+            "is_success": False,
+            "target_height_above_table": float(target_pos[2] - env.table_height),
+        }
+        return float(reward), False, info
+
 class LiftingTask:
     """Simple lifting task for fine-tuning from a reaching checkpoint."""
 
@@ -583,9 +639,9 @@ class GraspingTask:
     SUCCESS_BONUS = 0.5
     TIME_PENALTY = 1e-3
     FAILURE_PENALTY = -1.0
-    REACHING_ONLY_END_STEP = 500_000
+    REACHING_ONLY_END_STEP = 1_000_000
     CLOSE_REWARD_FULL_STEP = 2_200_000
-    LIFTING_BLEND_FULL_STEP = 3_500_000
+    LIFTING_BLEND_FULL_STEP = 4_500_000
     CLOSE_REWARD_DECAY_END_STEP = 25_000_000
     BONUS_REWARD_FULL_BOOST_STEP = 20_000_000
     TABLE_DISTANCE_FULL_BOOST_STEP = 20_000_000
@@ -1329,7 +1385,7 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
     Create a task configuration by name.
 
     Args:
-        task_name: 'grasping', 'reaching', 'lifting', 'lifting_only', 'placing', 'placing_v2', or 'placing_v3'
+        task_name: 'grasping', 'reaching', 'pretraining', 'lifting', 'lifting_only', 'placing', 'placing_v2', or 'placing_v3'
         **kwargs: Additional parameters to override defaults
 
     Returns:
@@ -1339,6 +1395,8 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
         config = GraspingTask.get_default_config()
     elif task_name == "reaching":
         config = ReachingTask.get_default_config()
+    elif task_name == "pretraining":
+        config = PretrainingTask.get_default_config()
     elif task_name == "lifting":
         config = LiftingTask.get_default_config()
     elif task_name == "lifting_only":
@@ -1360,6 +1418,11 @@ def create_task_config(task_name: str, **kwargs) -> Dict[str, Any]:
             config["reward_fn"] = GraspingTask.reward_function
         elif reward_variant == "shaped":
             config["reward_fn"] = GraspingTask.reward_function_shaped
+        else:
+            raise ValueError(f"Unknown reward variant: {reward_variant}")
+    elif task_name == "pretraining":
+        if reward_variant in {"default", "pretraining"}:
+            config["reward_fn"] = PretrainingTask.reward_function
         else:
             raise ValueError(f"Unknown reward variant: {reward_variant}")
     elif task_name == "lifting":
